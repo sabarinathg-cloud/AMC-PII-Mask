@@ -214,6 +214,13 @@ class RuntimeConfig:
     limit: Optional[int] = None
     shard_index: int = 0
     shard_count: int = 1
+
+    # True multi-file batching. This batches transcript-only ASR engines and neural PII
+    # across several files while still using Whisper as the word-timestamp anchor.
+    # Keep this conservative for long full-call audio because decoded 48 kHz stereo
+    # buffers are held until the batch is finalized.
+    file_batch_size: int = 2
+    file_batch_max_decoded_audio_gb: float = 2.0
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
     ffmpeg_threads: int = 1
@@ -368,6 +375,10 @@ def validate_config(config: PipelineConfig) -> PipelineConfig:
         raise ValueError("runtime.shard_count must be >= 1")
     if not (0 <= int(config.runtime.shard_index) < int(config.runtime.shard_count)):
         raise ValueError("runtime.shard_index must satisfy 0 <= shard_index < shard_count")
+    if int(getattr(config.runtime, "file_batch_size", 1)) < 1:
+        raise ValueError("runtime.file_batch_size must be >= 1")
+    if float(getattr(config.runtime, "file_batch_max_decoded_audio_gb", 0.0)) <= 0:
+        raise ValueError("runtime.file_batch_max_decoded_audio_gb must be > 0")
     if config.runtime.unmasked_copy_method not in {"hardlink_or_copy", "copy"}:
         raise ValueError("runtime.unmasked_copy_method must be hardlink_or_copy or copy. Symlinks are not allowed for deliverable audio.")
 

@@ -173,6 +173,12 @@ runtime:
   shard_index: 0
   shard_count: 1
 
+  # True multi-file microbatching. This batches transcript-only ASR engines
+  # and PII detection across files. Keep conservative for long full-call audio
+  # because decoded 48 kHz stereo buffers are held until the batch is finalized.
+  file_batch_size: 2
+  file_batch_max_decoded_audio_gb: 2.0
+
   ffmpeg_path: ffmpeg
   ffprobe_path: ffprobe
   ffmpeg_threads: 1

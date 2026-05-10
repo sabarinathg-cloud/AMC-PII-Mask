@@ -1,11 +1,11 @@
-amc_pii_audio_masking_pipeline_v4_multiasr_optimized
+amc_pii_audio_masking_pipeline_v5_batch_optimized
 
 Changes:
 - Four configurable ASR engines: whisper, qwen, cohere, granite.
-- Whisper timestamp anchor for word-level audio masking.
-- Per-channel ASR consensus transcript.
-- PII detection over final consensus plus every enabled ASR transcript by default.
-- Projection of transcript-only ASR entities onto Whisper word timestamps.
+- File-level micro-batching through runtime.file_batch_size.
+- Qwen/Cohere/Granite batch across files and channels.
+- faster-whisper BatchedInferencePipeline remains the timestamp anchor.
+- Neural PII detection batches across all transcripts in a file batch.
+- Single decode path, no forced alignment, no-PII fast copy, atomic writes, output validation.
 - Conservative full-channel fallback for unmapped PII.
-- CLI overrides for enabling/disabling ASR engines.
-- Tests: 14 passed.
+- Tests: 16 passed.

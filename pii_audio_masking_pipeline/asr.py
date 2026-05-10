@@ -39,6 +39,7 @@ class ASRResult:
     timestamp_retry_used: bool = False
     timestamp_suspicious: bool = False
     error: Optional[str] = None
+    file_id: Optional[str] = None
 
 
 @dataclass
@@ -50,6 +51,7 @@ class ChannelASRBundle:
     anchor_engine: Optional[str]
     anchor_words: List[Dict[str, Any]]
     consensus: Dict[str, Any]
+    file_id: Optional[str] = None
 
 
 def _cfg_get(cfg: Any, name: str, default: Any = None) -> Any:
@@ -622,23 +624,27 @@ class QwenASR:
         paths = [str(p) for p in paths]
         channels = [int(c) for c in channels]
         language = str(_engine_get(self.engine_cfg, "language", "English"))
-        try:
-            raw = self.model.transcribe(audio=list(paths), language=language)
-            if not isinstance(raw, list):
-                raw = [raw]
-            texts = [self._text(r) for r in raw]
-            if len(texts) != len(paths):
-                raise RuntimeError(f"Qwen returned {len(texts)} outputs for {len(paths)} inputs")
-            return [ASRResult(channel=ch, transcript=txt, words=[], engine=self.engine_name) for ch, txt in zip(channels, texts)]
-        except Exception as batch_error:
-            logger.warning("Qwen batch transcription failed, falling back one-by-one: %s", batch_error)
-            out: list[ASRResult] = []
-            for p, ch in zip(paths, channels):
-                try:
-                    out.append(ASRResult(channel=ch, transcript=self._text(self.model.transcribe(audio=p, language=language)), words=[], engine=self.engine_name))
-                except Exception as e:
-                    out.append(ASRResult(channel=ch, transcript="", words=[], engine=self.engine_name, error=repr(e)))
-            return out
+        batch_size = max(1, int(_engine_get(self.engine_cfg, "batch_size", len(paths) or 1)))
+        out: list[ASRResult] = []
+        for start in range(0, len(paths), batch_size):
+            chunk_paths = paths[start:start + batch_size]
+            chunk_channels = channels[start:start + batch_size]
+            try:
+                raw = self.model.transcribe(audio=list(chunk_paths), language=language)
+                if not isinstance(raw, list):
+                    raw = [raw]
+                texts = [self._text(r) for r in raw]
+                if len(texts) != len(chunk_paths):
+                    raise RuntimeError(f"Qwen returned {len(texts)} outputs for {len(chunk_paths)} inputs")
+                out.extend(ASRResult(channel=ch, transcript=txt, words=[], engine=self.engine_name) for ch, txt in zip(chunk_channels, texts))
+            except Exception as batch_error:
+                logger.warning("Qwen batch transcription failed, falling back one-by-one: %s", batch_error)
+                for p, ch in zip(chunk_paths, chunk_channels):
+                    try:
+                        out.append(ASRResult(channel=ch, transcript=self._text(self.model.transcribe(audio=p, language=language)), words=[], engine=self.engine_name))
+                    except Exception as e:
+                        out.append(ASRResult(channel=ch, transcript="", words=[], engine=self.engine_name, error=repr(e)))
+        return out
 
     def unload(self) -> None:
         try:
@@ -847,7 +853,13 @@ class MultiASRTranscriber:
     Whisper remains the timestamp anchor because it provides word timestamps. Other ASR
     engines improve PII recall and transcript quality; their spans are projected onto the
     anchor word timeline.
+
+    transcribe_channel_batch() is the high-throughput entry point. It accepts channels
+    from multiple files at once. Whisper uses faster-whisper internal batching, while
+    transcript-only engines get true cross-file batches.
     """
+
+    _SINGLE_FILE_ID = "__single_file__"
 
     def __init__(self, cfg: Any):
         self.cfg = cfg
@@ -888,28 +900,49 @@ class MultiASRTranscriber:
         return str(_cfg_get(self.cfg, "model_residency", "keep_loaded")) == "unload_after_file"
 
     def transcribe_channels(self, asr_inputs: Sequence[dict], work_dir: Path, keep_temp: bool = False) -> List[ChannelASRBundle]:
+        rows = []
+        for item in asr_inputs:
+            row = dict(item)
+            row["file_id"] = self._SINGLE_FILE_ID
+            rows.append(row)
+        grouped = self.transcribe_channel_batch(rows, work_dir=work_dir, keep_temp=keep_temp)
+        return grouped.get(self._SINGLE_FILE_ID, [])
+
+    def transcribe_channel_batch(self, asr_inputs: Sequence[dict], work_dir: Path, keep_temp: bool = False) -> Dict[str, List[ChannelASRBundle]]:
         from tempfile import TemporaryDirectory
         from .audio_io import write_mono_wav_pcm16
 
-        asr_inputs = list(asr_inputs)
+        items: list[dict] = []
+        for idx, item in enumerate(asr_inputs):
+            row = dict(item)
+            row["file_id"] = str(row.get("file_id", self._SINGLE_FILE_ID))
+            row["channel"] = int(row["channel"])
+            row["sample_rate"] = int(row.get("sample_rate", 16000))
+            row["_batch_index"] = idx
+            items.append(row)
+
+        if not items:
+            return {}
+
         temp_ctx: Optional[TemporaryDirectory] = None
         temp_dir: Optional[Path] = None
         wav_paths: Dict[int, Path] = {}
 
         def ensure_wav(item: dict) -> Path:
             nonlocal temp_ctx, temp_dir
-            channel = int(item["channel"])
-            if channel in wav_paths:
-                return wav_paths[channel]
+            batch_index = int(item["_batch_index"])
+            if batch_index in wav_paths:
+                return wav_paths[batch_index]
             if temp_ctx is None:
                 temp_parent = Path(work_dir) / "tmp"
                 temp_parent.mkdir(parents=True, exist_ok=True)
-                temp_ctx = TemporaryDirectory(prefix="pii_multiasr_", dir=str(temp_parent))
+                temp_ctx = TemporaryDirectory(prefix="pii_multiasr_batch_", dir=str(temp_parent))
                 temp_dir = Path(temp_ctx.name)
             assert temp_dir is not None
-            wav_path = temp_dir / f"channel_{channel}.wav"
+            channel = int(item["channel"])
+            wav_path = temp_dir / f"item_{batch_index:06d}_ch{channel}.wav"
             write_mono_wav_pcm16(item["audio"], wav_path, sample_rate=int(item.get("sample_rate", 16000)))
-            wav_paths[channel] = wav_path
+            wav_paths[batch_index] = wav_path
             return wav_path
 
         all_results: list[ASRResult] = []
@@ -919,41 +952,49 @@ class MultiASRTranscriber:
                 engine = self._get_engine(name)
                 try:
                     if getattr(engine, "supports_audio_input", False):
-                        for item in asr_inputs:
+                        for item in items:
                             channel = int(item["channel"])
                             try:
-                                all_results.append(engine.transcribe_audio(item["audio"], channel=channel, sample_rate=int(item.get("sample_rate", 16000))))
+                                r = engine.transcribe_audio(item["audio"], channel=channel, sample_rate=int(item.get("sample_rate", 16000)))
                             except Exception as e:
-                                # Some faster-whisper builds reject numpy input. Reuse one temp WAV per channel.
-                                logger.warning("ASR engine=%s in-memory input failed for channel=%s, using temp WAV: %s", name, channel, e)
+                                logger.warning(
+                                    "ASR engine=%s in-memory input failed for file_id=%s channel=%s, using temp WAV: %s",
+                                    name, item["file_id"], channel, e,
+                                )
                                 try:
-                                    all_results.append(engine.transcribe_path(ensure_wav(item), channel=channel))
+                                    r = engine.transcribe_path(ensure_wav(item), channel=channel)
                                 except Exception as e2:
                                     if fail_on_engine_error:
                                         raise
-                                    all_results.append(ASRResult(channel=channel, transcript="", words=[], engine=name, error=repr(e2)))
+                                    r = ASRResult(channel=channel, transcript="", words=[], engine=name, error=repr(e2))
+                            r.file_id = str(item["file_id"])
+                            all_results.append(r)
                     else:
-                        paths = [ensure_wav(item) for item in asr_inputs]
-                        channels = [int(item["channel"]) for item in asr_inputs]
-                        all_results.extend(engine.transcribe_paths(paths, channels))
+                        paths = [ensure_wav(item) for item in items]
+                        channels = [int(item["channel"]) for item in items]
+                        rows = engine.transcribe_paths(paths, channels)
+                        if len(rows) != len(items):
+                            raise RuntimeError(f"ASR engine={name} returned {len(rows)} rows for {len(items)} inputs")
+                        for r, item in zip(rows, items):
+                            r.file_id = str(item["file_id"])
+                            all_results.append(r)
                 except Exception as e:
                     if fail_on_engine_error:
                         raise
-                    logger.warning("ASR engine=%s failed for this file: %s", name, e)
-                    for item in asr_inputs:
-                        all_results.append(ASRResult(channel=int(item["channel"]), transcript="", words=[], engine=name, error=repr(e)))
+                    logger.warning("ASR engine=%s failed for this micro-batch: %s", name, e)
+                    for item in items:
+                        all_results.append(ASRResult(file_id=str(item["file_id"]), channel=int(item["channel"]), transcript="", words=[], engine=name, error=repr(e)))
 
-            bundles = self._bundle_results(all_results, asr_inputs)
+            grouped = self._bundle_results_by_file(all_results, items)
             anchor_name = str(_cfg_get(self.cfg, "timestamp_anchor_engine", "whisper"))
-            for b in bundles:
-                if anchor_name in self.enabled_names and not b.anchor_words and any(r.transcript for r in b.engine_results):
-                    logger.warning(
-                        "Timestamp anchor engine '%s' produced no word timestamps for channel=%s. "
-                        "If PII is detected on this channel, the unmapped-entity policy will be used.",
-                        anchor_name,
-                        b.channel,
-                    )
-            return bundles
+            for bundles in grouped.values():
+                for b in bundles:
+                    if anchor_name in self.enabled_names and not b.anchor_words and any(r.transcript for r in b.engine_results):
+                        logger.warning(
+                            "Timestamp anchor engine '%s' produced no word timestamps for file_id=%s channel=%s. If PII is detected, unmapped-entity policy will be used.",
+                            anchor_name, b.file_id, b.channel,
+                        )
+            return grouped
         finally:
             if temp_ctx is not None and not keep_temp:
                 temp_ctx.cleanup()
@@ -961,40 +1002,69 @@ class MultiASRTranscriber:
                 self.unload_all()
 
     def _bundle_results(self, results: Sequence[ASRResult], asr_inputs: Sequence[dict]) -> List[ChannelASRBundle]:
-        by_channel: Dict[int, List[ASRResult]] = {int(item["channel"]): [] for item in asr_inputs}
+        rows = []
+        for item in asr_inputs:
+            row = dict(item)
+            row["file_id"] = self._SINGLE_FILE_ID
+            rows.append(row)
+        grouped = self._bundle_results_by_file(results, rows)
+        return grouped.get(self._SINGLE_FILE_ID, [])
+
+    def _bundle_results_by_file(self, results: Sequence[ASRResult], asr_inputs: Sequence[dict]) -> Dict[str, List[ChannelASRBundle]]:
+        file_channel_order: Dict[str, list[int]] = {}
+        by_key: Dict[tuple[str, int], List[ASRResult]] = {}
+
+        for item in asr_inputs:
+            file_id = str(item.get("file_id", self._SINGLE_FILE_ID))
+            channel = int(item["channel"])
+            file_channel_order.setdefault(file_id, [])
+            if channel not in file_channel_order[file_id]:
+                file_channel_order[file_id].append(channel)
+            by_key.setdefault((file_id, channel), [])
+
         for r in results:
-            by_channel.setdefault(int(r.channel), []).append(r)
+            file_id = str(getattr(r, "file_id", None) or self._SINGLE_FILE_ID)
+            channel = int(r.channel)
+            by_key.setdefault((file_id, channel), []).append(r)
+            file_channel_order.setdefault(file_id, [])
+            if channel not in file_channel_order[file_id]:
+                file_channel_order[file_id].append(channel)
 
         consensus_cfg = dict(_cfg_get(self.cfg, "consensus", {}) or {})
         anchor_name = str(_cfg_get(self.cfg, "timestamp_anchor_engine", "whisper"))
-        bundles: list[ChannelASRBundle] = []
-        for channel in sorted(by_channel):
-            rows = by_channel[channel]
-            consensus = build_consensus(rows, consensus_cfg)
-            final_transcript = str(consensus.get("final_transcript") or "").strip()
+        grouped: Dict[str, List[ChannelASRBundle]] = {}
 
-            anchor = next((r for r in rows if r.engine == anchor_name and r.words), None)
-            if anchor is None:
-                anchor = next((r for r in rows if r.words), None)
-            anchor_words = [dict(w, engine=getattr(anchor, "engine", anchor_name)) for w in (anchor.words if anchor else [])]
-            anchor_engine = anchor.engine if anchor else None
+        for file_id, channels in file_channel_order.items():
+            bundles: list[ChannelASRBundle] = []
+            for channel in sorted(channels):
+                rows = by_key.get((file_id, channel), [])
+                consensus = build_consensus(rows, consensus_cfg)
+                final_transcript = str(consensus.get("final_transcript") or "").strip()
 
-            selected_engine = consensus.get("selected_engine")
-            selected = next((r for r in rows if r.engine == selected_engine), None)
-            if selected is not None and selected.words and selected.transcript.strip() == final_transcript:
-                final_words = selected.words
-            elif anchor is not None and anchor.transcript.strip() == final_transcript and anchor.words:
-                final_words = anchor.words
-            else:
-                final_words = align_transcript_to_timed_words(final_transcript, anchor_words, channel=channel)
+                anchor = next((r for r in rows if r.engine == anchor_name and r.words), None)
+                if anchor is None:
+                    anchor = next((r for r in rows if r.words), None)
+                anchor_words = [dict(w, engine=getattr(anchor, "engine", anchor_name)) for w in (anchor.words if anchor else [])]
+                anchor_engine = anchor.engine if anchor else None
 
-            bundles.append(ChannelASRBundle(
-                channel=channel,
-                final_transcript=final_transcript,
-                final_words=final_words,
-                engine_results=rows,
-                anchor_engine=anchor_engine,
-                anchor_words=anchor_words,
-                consensus=consensus,
-            ))
-        return bundles
+                selected_engine = consensus.get("selected_engine")
+                selected = next((r for r in rows if r.engine == selected_engine), None)
+                if selected is not None and selected.words and selected.transcript.strip() == final_transcript:
+                    final_words = selected.words
+                elif anchor is not None and anchor.transcript.strip() == final_transcript and anchor.words:
+                    final_words = anchor.words
+                else:
+                    final_words = align_transcript_to_timed_words(final_transcript, anchor_words, channel=channel)
+
+                bundles.append(ChannelASRBundle(
+                    file_id=file_id,
+                    channel=channel,
+                    final_transcript=final_transcript,
+                    final_words=final_words,
+                    engine_results=rows,
+                    anchor_engine=anchor_engine,
+                    anchor_words=anchor_words,
+                    consensus=consensus,
+                ))
+            grouped[file_id] = bundles
+        return grouped

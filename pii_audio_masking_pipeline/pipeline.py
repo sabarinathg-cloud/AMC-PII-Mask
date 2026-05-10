@@ -145,6 +145,256 @@ class PIIMaskingPipeline:
         else:
             raise ValueError(f"Unsupported asr.input_audio_strategy: {strategy}")
 
+        return self._finalize_outputs(
+            input_path=input_path,
+            output_path=output_path,
+            sidecar_path=sidecar_path,
+            started=started,
+            meta=meta,
+            duration=duration,
+            audio_48k=audio_48k,
+            transcripts=transcripts,
+            all_entities=all_entities,
+            raw_spans=raw_spans,
+            used_single_decode=used_single_decode,
+            used_combined_channel_extract=used_combined_channel_extract,
+            unmapped_fallback_used=unmapped_fallback_used,
+            batch_optimized=False,
+        )
+
+    def process_files_batch(self, input_paths: Sequence[str | Path], rows: Optional[Sequence[Optional[dict]]] = None) -> list[Dict[str, Any]]:
+        """Process a micro-batch of files with cross-file ASR and PII batching.
+
+        This is the high-throughput path. It keeps the same per-file safety guarantees
+        as process_file(), but batches transcript-only ASR engines and neural PII
+        detectors across files. Whisper remains the timestamp anchor and uses
+        faster-whisper's internal BatchedInferencePipeline per channel.
+        """
+        paths = [Path(p) for p in input_paths]
+        if rows is None:
+            row_list: list[Optional[dict]] = [None] * len(paths)
+        else:
+            row_list = list(rows)
+            if len(row_list) != len(paths):
+                raise ValueError("rows must be None or have the same length as input_paths")
+
+        if len(paths) <= 1 or not hasattr(self.asr, "transcribe_channel_batch"):
+            return [self.process_file(path, row=row) for path, row in zip(paths, row_list)]
+
+        strategy = str(getattr(self.config.asr, "input_audio_strategy", "single_decode"))
+        if strategy != "single_decode":
+            return [self.process_file(path, row=row) for path, row in zip(paths, row_list)]
+
+        estimated_gb = self._estimate_decoded_batch_gb(paths)
+        max_gb = float(getattr(self.config.runtime, "file_batch_max_decoded_audio_gb", 2.0))
+        if estimated_gb is not None and estimated_gb > max_gb:
+            logger.warning(
+                "Batch decoded-audio estimate %.2f GB exceeds runtime.file_batch_max_decoded_audio_gb=%.2f. Falling back to per-file processing.",
+                estimated_gb,
+                max_gb,
+            )
+            return [self.process_file(path, row=row) for path, row in zip(paths, row_list)]
+
+        result_slots: list[Optional[Dict[str, Any]]] = [None] * len(paths)
+        contexts: dict[str, dict] = {}
+        batch_asr_inputs: list[dict] = []
+        max_single_decode = getattr(self.config.asr, "single_decode_max_audio_seconds", None)
+
+        for idx, (input_path, row) in enumerate(zip(paths, row_list)):
+            started = time.time()
+            try:
+                output_path = self.output_path_for(input_path)
+                sidecar_path = self.sidecar_path_for(output_path)
+                if input_path.resolve() == output_path.resolve():
+                    raise ValueError(
+                        f"Refusing to overwrite original audio. Configure paths.output_root outside the input file path: {input_path}"
+                    )
+
+                meta = ffprobe_audio(input_path, ffprobe_path=self.config.runtime.ffprobe_path)
+                if self._should_skip_existing(input_path, output_path, sidecar_path, meta):
+                    result_slots[idx] = {
+                        "input_path": str(input_path),
+                        "output_path": str(output_path),
+                        "status": "skipped_existing",
+                        "sidecar_path": str(sidecar_path),
+                        "valid": True,
+                    }
+                    continue
+
+                duration = meta.get("duration_sec")
+                if self.config.asr.max_audio_seconds is not None and duration is not None:
+                    if float(duration) > float(self.config.asr.max_audio_seconds):
+                        raise ValueError(f"Audio duration {duration:.2f}s exceeds max_audio_seconds={self.config.asr.max_audio_seconds}")
+
+                if max_single_decode is not None and duration is not None and float(duration) > float(max_single_decode):
+                    result_slots[idx] = self.process_file(input_path, row=row)
+                    continue
+
+                n_input_channels = int(meta.get("channels") or 1)
+                channel_count = min(2, max(1, n_input_channels))
+                audio_48k = decode_to_float32_stereo_48k(
+                    input_path,
+                    ffmpeg_path=self.config.runtime.ffmpeg_path,
+                    threads=self.config.runtime.ffmpeg_threads,
+                    sample_rate=self.config.masking.output_sample_rate,
+                    channels=self.config.masking.output_channels,
+                )
+                asr_inputs = make_asr_audio_inputs(
+                    audio_48k,
+                    mode=self.config.asr.mode,
+                    input_channels=channel_count,
+                    source_sr=self.config.masking.output_sample_rate,
+                    target_sr=self.config.asr.channel_wav_sample_rate,
+                )
+
+                file_id = str(idx)
+                for item in asr_inputs:
+                    item["file_id"] = file_id
+                    batch_asr_inputs.append(item)
+
+                contexts[file_id] = {
+                    "index": idx,
+                    "input_path": input_path,
+                    "row": row,
+                    "started": started,
+                    "output_path": output_path,
+                    "sidecar_path": sidecar_path,
+                    "meta": meta,
+                    "duration": duration,
+                    "audio_48k": audio_48k,
+                    "transcripts": [],
+                    "all_entities": [],
+                    "raw_spans": [],
+                    "unmapped_fallback_used": False,
+                    "used_single_decode": True,
+                    "used_combined_channel_extract": False,
+                }
+            except Exception as e:
+                if self.config.runtime.fail_fast:
+                    raise
+                self._delete_partial_outputs_silent(input_path)
+                result_slots[idx] = self._failed_result(input_path, repr(e))
+
+        if batch_asr_inputs:
+            try:
+                bundles_by_file = self.asr.transcribe_channel_batch(
+                    batch_asr_inputs,
+                    work_dir=Path(self.config.paths.work_dir),
+                    keep_temp=bool(self.config.runtime.keep_temp),
+                )
+            except Exception as e:
+                logger.warning("ASR micro-batch failed; falling back to file-by-file processing. Error: %s", e)
+                for file_id, ctx in contexts.items():
+                    idx = int(ctx["index"])
+                    if result_slots[idx] is not None:
+                        continue
+                    try:
+                        result_slots[idx] = self.process_file(ctx["input_path"], row=ctx.get("row"))
+                    except Exception as e2:
+                        if self.config.runtime.fail_fast:
+                            raise
+                        self._delete_partial_outputs_silent(ctx["input_path"])
+                        result_slots[idx] = self._failed_result(ctx["input_path"], repr(e2))
+                return [r for r in result_slots if r is not None]
+
+            detection_items: list[dict] = []
+            for file_id, ctx in contexts.items():
+                for bundle in bundles_by_file.get(file_id, []):
+                    ctx["transcripts"].append(self._bundle_to_transcript_dict(bundle))
+                    for item in self._detection_items_for_bundle(bundle):
+                        item["file_id"] = file_id
+                        detection_items.append(item)
+
+            if detection_items:
+                texts = [d["text"] for d in detection_items]
+                pii_rows = [contexts[str(d["file_id"])].get("row") for d in detection_items]
+                detected_batches = self.detector.detect_batch(texts, rows=pii_rows)
+                for item, entities in zip(detection_items, detected_batches):
+                    file_id = str(item["file_id"])
+                    ctx = contexts[file_id]
+                    enriched = []
+                    for e in entities:
+                        ent = dict(e)
+                        ent["channel"] = int(item["channel"])
+                        ent["transcript_source"] = item["source"]
+                        ent["asr_engine"] = item.get("engine")
+                        enriched.append(ent)
+                        ctx["all_entities"].append(ent)
+                    spans, used = self._map_entities_to_spans_conservative(
+                        enriched,
+                        item.get("words") or [],
+                        int(item["channel"]),
+                        ctx.get("duration"),
+                    )
+                    ctx["raw_spans"].extend(spans)
+                    ctx["unmapped_fallback_used"] = bool(ctx["unmapped_fallback_used"] or used)
+
+            for file_id, ctx in contexts.items():
+                idx = int(ctx["index"])
+                if result_slots[idx] is not None:
+                    continue
+                try:
+                    result_slots[idx] = self._finalize_outputs(
+                        input_path=ctx["input_path"],
+                        output_path=ctx["output_path"],
+                        sidecar_path=ctx["sidecar_path"],
+                        started=ctx["started"],
+                        meta=ctx["meta"],
+                        duration=ctx.get("duration"),
+                        audio_48k=ctx["audio_48k"],
+                        transcripts=ctx["transcripts"],
+                        all_entities=ctx["all_entities"],
+                        raw_spans=ctx["raw_spans"],
+                        used_single_decode=bool(ctx.get("used_single_decode", True)),
+                        used_combined_channel_extract=bool(ctx.get("used_combined_channel_extract", False)),
+                        unmapped_fallback_used=bool(ctx.get("unmapped_fallback_used", False)),
+                        batch_optimized=True,
+                    )
+                    ctx["audio_48k"] = None
+                except Exception as e:
+                    if self.config.runtime.fail_fast:
+                        raise
+                    self._delete_partial_outputs_silent(ctx["input_path"])
+                    result_slots[idx] = self._failed_result(ctx["input_path"], repr(e))
+
+        return [r if r is not None else self._failed_result(paths[i], "internal_error: missing batch result") for i, r in enumerate(result_slots)]
+
+    def _finalize_outputs(
+        self,
+        input_path: Path,
+        output_path: Path,
+        sidecar_path: Path,
+        started: float,
+        meta: dict,
+        duration: Optional[float],
+        audio_48k,
+        transcripts: list[dict],
+        all_entities: list[dict],
+        raw_spans: list[dict],
+        used_single_decode: bool,
+        used_combined_channel_extract: bool,
+        unmapped_fallback_used: bool,
+        batch_optimized: bool,
+    ) -> Dict[str, Any]:
+        no_pii_fast_copy_used = False
+
+        # Safety fail-safe: an empty ASR result is not proof that there is no PII.
+        # Without this, an ASR outage could incorrectly take the no-PII fast-copy path.
+        if not self._has_any_transcript(transcripts):
+            if duration is None:
+                raise RuntimeError("ASR produced no transcript and input duration is unavailable; refusing to copy unmasked audio")
+            raw_spans = self._full_audio_spans(duration, channels=int(meta.get("channels") or self.config.masking.output_channels))
+            all_entities = list(all_entities) + [{
+                "text": "",
+                "type": "EMPTY_TRANSCRIPT_FAILSAFE",
+                "start": 0,
+                "end": 0,
+                "source": "pipeline",
+                "score": 1.0,
+                "reason": "ASR produced no transcript; full-audio masking applied to avoid unmasked PII leakage",
+            }]
+            unmapped_fallback_used = True
+
         if all_entities and not raw_spans:
             raw_spans, unmapped_fallback_used = self._apply_unmapped_entity_policy(all_entities, duration)
 
@@ -208,13 +458,9 @@ class PIIMaskingPipeline:
                 input_meta=meta,
             )
         else:
-            validation = {
-                "valid": True,
-                "validation_skipped": True,
-                "checks": {},
-            }
+            validation = {"valid": True, "validation_skipped": True, "checks": {}}
 
-        elapsed = time.time() - started
+        elapsed = time.time() - float(started)
         sidecar = self._build_sidecar(
             input_path=input_path,
             output_path=output_path,
@@ -231,15 +477,43 @@ class PIIMaskingPipeline:
             unmapped_fallback_used=unmapped_fallback_used,
             no_pii_fast_copy_used=no_pii_fast_copy_used,
         )
+        if batch_optimized:
+            sidecar["optimizations"]["asr_file_microbatching"] = True
+            sidecar["optimizations"]["pii_cross_file_batching"] = True
+            sidecar["runtime_file_batch_size"] = int(getattr(self.config.runtime, "file_batch_size", 1))
         write_json(sidecar_path, sidecar)
         return self._result_row(input_path, output_path, sidecar_path, elapsed, duration, transcripts, all_entities, merged_spans, validation, status)
 
-    def can_resume_skip(self, input_path: str | Path, output_path: str | Path, sidecar_path: str | Path) -> bool:
-        """Return True only when an existing output is safe to reuse.
+    def _estimate_decoded_batch_gb(self, paths: Sequence[Path]) -> Optional[float]:
+        total_seconds = 0.0
+        for input_path in paths:
+            try:
+                meta = ffprobe_audio(input_path, ffprobe_path=self.config.runtime.ffprobe_path)
+                duration = meta.get("duration_sec")
+                if duration is None:
+                    return None
+                total_seconds += float(duration)
+            except Exception:
+                return None
+        bytes_needed = total_seconds * float(self.config.masking.output_sample_rate) * float(self.config.masking.output_channels) * 4.0
+        return bytes_needed / (1024.0 ** 3)
 
-        The SQLite state alone is not trusted. The output file and sidecar must still exist,
-        and by default the output is ffprobe-validated before skipping.
-        """
+    def _delete_partial_outputs_silent(self, input_path: str | Path) -> None:
+        if not getattr(self.config.runtime, "delete_failed_partial_outputs", True):
+            return
+        try:
+            out = self.output_path_for(input_path)
+            sidecar = self.sidecar_path_for(out)
+            for partial in (out, sidecar):
+                if Path(partial).exists():
+                    Path(partial).unlink()
+        except Exception:
+            pass
+
+    def _failed_result(self, input_path: str | Path, error: str) -> Dict[str, Any]:
+        return {"input_path": str(input_path), "status": "failed", "error": error}
+
+    def can_resume_skip(self, input_path: str | Path, output_path: str | Path, sidecar_path: str | Path) -> bool:
         input_path = Path(input_path)
         output_path = Path(output_path)
         sidecar_path = Path(sidecar_path)
@@ -270,12 +544,6 @@ class PIIMaskingPipeline:
         return False
 
     def _transcribe_asr_inputs(self, asr_inputs: Sequence[dict]) -> list[ASRResult] | list[ChannelASRBundle]:
-        """Transcribe prepared ASR channel inputs.
-
-        Production path uses MultiASRTranscriber: Whisper + optional Qwen/Cohere/Granite,
-        with a consensus transcript per channel. Tests and older callers can still inject a
-        single-model fake ASR exposing transcribe_audio/transcribe_path.
-        """
         if hasattr(self.asr, "transcribe_channels"):
             return self.asr.transcribe_channels(
                 asr_inputs,
@@ -336,12 +604,10 @@ class PIIMaskingPipeline:
                 )
                 if hasattr(self.asr, "transcribe_channels"):
                     import numpy as np
-                    # Use the already-created temp WAV as compatibility input for every enabled model.
-                    from .audio_io import resample_mono_float32
                     with __import__("wave").open(str(wav_path), "rb") as wf:
                         data = wf.readframes(wf.getnframes())
                     audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                    asr_inputs = [{"channel": -1, "audio": resample_mono_float32(audio, self.config.asr.channel_wav_sample_rate, self.config.asr.channel_wav_sample_rate), "sample_rate": self.config.asr.channel_wav_sample_rate}]
+                    asr_inputs = [{"channel": -1, "audio": audio, "sample_rate": self.config.asr.channel_wav_sample_rate}]
                     bundles_or_results = self._transcribe_asr_inputs(asr_inputs)
                     fallback_used = self._handle_asr_results(bundles_or_results, transcripts, all_entities, raw_spans, row, duration)
                     return used_combined, bool(fallback_used)
@@ -376,20 +642,11 @@ class PIIMaskingPipeline:
                             ffmpeg_path=self.config.runtime.ffmpeg_path,
                             threads=self.config.runtime.ffmpeg_threads,
                         )
-                    if hasattr(self.asr, "transcribe_channels"):
-                        # MultiASR optimized path normally uses single_decode. This fallback decodes the temp WAV
-                        # into memory once per channel, then MultiASR reuses temp WAVs for transcript-only engines.
-                        import numpy as np
-                        with __import__("wave").open(str(wav_path), "rb") as wf:
-                            data = wf.readframes(wf.getnframes())
-                        audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                        results.append(ASRResult(channel=channel, transcript="", words=[], engine="placeholder"))
-                    else:
-                        results.append(self.asr.transcribe_path(wav_path, channel=channel))
+                        channel_wavs[channel] = wav_path
                 if hasattr(self.asr, "transcribe_channels"):
-                    asr_inputs = []
                     import numpy as np
-                    for channel, wav_path in sorted(channel_wavs.items() if channel_wavs else [(c, temp_dir / f"ch{c}.wav") for c in range(channel_count)]):
+                    asr_inputs = []
+                    for channel, wav_path in sorted(channel_wavs.items()):
                         with __import__("wave").open(str(wav_path), "rb") as wf:
                             data = wf.readframes(wf.getnframes())
                         audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
@@ -397,6 +654,8 @@ class PIIMaskingPipeline:
                     bundles_or_results = self._transcribe_asr_inputs(asr_inputs)
                     fallback_used = self._handle_asr_results(bundles_or_results, transcripts, all_entities, raw_spans, row, duration)
                     return used_combined, bool(fallback_used)
+                for channel, wav_path in sorted(channel_wavs.items()):
+                    results.append(self.asr.transcribe_path(wav_path, channel=channel))
             else:
                 raise ValueError(f"Unsupported ASR mode: {self.config.asr.mode}")
             fallback_used = self._handle_asr_results(results, transcripts, all_entities, raw_spans, row, duration)
@@ -524,6 +783,32 @@ class PIIMaskingPipeline:
             spans.extend(fallback)
             fallback_used = fallback_used or used
         return spans, fallback_used
+
+    def _has_any_transcript(self, transcripts: list[dict]) -> bool:
+        for row in transcripts or []:
+            if str(row.get("transcript") or row.get("final_transcript") or "").strip():
+                return True
+            engine_transcripts = row.get("engine_transcripts") or {}
+            if isinstance(engine_transcripts, dict):
+                for value in engine_transcripts.values():
+                    if str(value or "").strip():
+                        return True
+        return False
+
+    def _full_audio_spans(self, duration: float, channels: int = 2) -> list[dict]:
+        n_channels = max(1, min(int(channels or 2), int(self.config.masking.output_channels or 2)))
+        return [
+            {
+                "start": 0.0,
+                "end": max(0.0, float(duration)),
+                "duration": max(0.0, float(duration)),
+                "channel": channel,
+                "source": "empty_transcript_failsafe",
+                "type": "EMPTY_TRANSCRIPT_FAILSAFE",
+                "text": "",
+            }
+            for channel in range(n_channels)
+        ]
 
     def _apply_unmapped_entity_policy(self, all_entities: list[dict], duration: Optional[float]) -> tuple[list[dict], bool]:
         policy = self.config.masking.unmapped_entity_policy
@@ -654,10 +939,10 @@ class PIIMaskingPipeline:
             "valid": validation.get("valid"),
         }
 
-
     def _bundle_to_transcript_dict(self, bundle: ChannelASRBundle) -> Dict[str, Any]:
         engine_rows = [self._asr_result_to_dict(r) for r in bundle.engine_results]
         d: Dict[str, Any] = {
+            "file_id": getattr(bundle, "file_id", None),
             "channel": bundle.channel,
             "engine": "consensus",
             "transcript": bundle.final_transcript,
@@ -677,6 +962,7 @@ class PIIMaskingPipeline:
 
     def _asr_result_to_dict(self, result: ASRResult) -> Dict[str, Any]:
         d = {
+            "file_id": getattr(result, "file_id", None),
             "channel": result.channel,
             "engine": result.engine,
             "transcript": result.transcript,

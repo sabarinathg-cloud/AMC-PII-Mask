@@ -1,6 +1,8 @@
 # AMC PII Audio Masking Pipeline
 
-Fast, resumable pipeline for masking personally identifiable information in stereo call audio while preserving the required output format:
+Fast, resumable speech PII masking pipeline for stereo AMC call audio.
+
+Final output is enforced as:
 
 ```text
 codec: Opus
@@ -9,177 +11,150 @@ channels: 2
 container: .opus
 ```
 
-The pipeline now uses a configurable **four-ASR ensemble**:
+The pipeline transcribes each call, detects PII in the transcript text, maps detected entities to word timestamps, masks only the required audio spans, and writes the masked audio back in the same required format.
 
-1. faster-whisper large-v3
-2. Qwen ASR
-3. Cohere ASR
-4. Granite speech
+## What is optimized now
 
-Each model can be enabled or disabled in `config.yaml`. Whisper remains the timestamp anchor because audio masking needs word timestamps. The other ASR models improve transcript quality and PII recall.
+This version uses batching at every practical layer:
+
+| Layer | What is batched | Config |
+|---|---|---|
+| File scheduler | Multiple files per processing micro-batch | `runtime.file_batch_size` |
+| Whisper | faster-whisper internal segment batching | `asr.engines.whisper.use_batched_pipeline`, `asr.engines.whisper.batch_size` |
+| Qwen | file-channel WAVs across the micro-batch | `asr.engines.qwen.batch_size` |
+| Cohere | file-channel WAVs across the micro-batch | `asr.engines.cohere.batch_size` |
+| Granite | file-channel WAVs across the micro-batch | `asr.engines.granite.batch_size` |
+| PII detection | all final and per-engine transcripts across the micro-batch | `pii.batch_size` |
+| Corpus scale-out | one process per shard or GPU | `runtime.shard_count`, `runtime.shard_index` |
+
+Important detail: Whisper is not cross-file batched because it is the timestamp anchor and faster-whisper does not reliably accept independent audio arrays as one list input. It uses `BatchedInferencePipeline`, which batches internal chunks. Qwen, Cohere, Granite, and neural PII detection are cross-file batched.
 
 ## Pipeline flow
 
 ```mermaid
 flowchart TD
-    A[Discover original audio.opus files] --> B[ffprobe input metadata]
+    A[Discover original audio.opus files] --> A1[Apply shard and resume filters]
+    A1 --> A2[Build file micro-batches]
+    A2 --> B[ffprobe metadata]
     B --> C{Already processed and valid?}
     C -- yes --> Z[Skip safely]
-    C -- no --> D[Decode once to stereo float32 48 kHz]
-    D --> E[Create 16 kHz mono ASR inputs per channel]
+    C -- no --> D[Decode each file once to stereo float32 48 kHz]
+    D --> E[Create 16 kHz mono channel inputs]
 
-    E --> F1[Whisper ASR with word timestamps]
-    E --> F2[Qwen ASR transcript]
-    E --> F3[Cohere ASR transcript]
-    E --> F4[Granite ASR transcript]
+    E --> F1[Whisper timestamp anchor\nfaster-whisper BatchedInferencePipeline]
+    E --> F2[Qwen ASR\ncross-file channel batch]
+    E --> F3[Cohere ASR\ncross-file channel batch]
+    E --> F4[Granite ASR\ncross-file channel batch]
 
     F1 --> G[Per-channel ASR consensus]
     F2 --> G
     F3 --> G
     F4 --> G
 
-    F1 --> H[Timestamp anchor words]
-    G --> I[Final consensus transcript]
-    H --> J[Align final transcript and model transcripts to anchor timeline]
+    G --> H[Final transcript per channel]
+    F1 --> I[Word timestamp anchor]
+    H --> J[Align consensus and non-Whisper transcripts to anchor timeline]
     I --> J
 
-    J --> K[PII detection]
-    K --> K1[Regex rules]
+    J --> K[Batch PII detection across all texts]
+    K --> K1[Regex]
     K --> K2[Spoken number rules]
     K --> K3[GLiNER]
     K --> K4[Piiranha]
     K --> K5[Optional spaCy]
 
-    K1 --> L[Map PII entities to audio spans]
+    K1 --> L[Map entities to timestamp spans]
     K2 --> L
     K3 --> L
     K4 --> L
     K5 --> L
 
-    L --> M{Any unmapped PII?}
-    M -- yes --> N[Fail-safe mask full detected channel]
-    M -- no --> O[Merge and pad spans]
+    L --> M{Mapped spans available?}
+    M -- no but PII exists --> N[Fail-safe mask full detected channel]
+    M -- yes --> O[Merge, pad, and de-duplicate spans]
     N --> O
 
     O --> P{PII spans found?}
     P -- no --> Q[Fast copy original if already stereo 48 kHz Opus]
     P -- yes --> R[Apply silence, beep, or noise mask in-place]
 
-    Q --> S[Atomic output write]
+    Q --> S[Atomic output]
     R --> T[Encode stereo 48 kHz Opus]
     T --> S
     S --> U[Validate codec, sample rate, channels, duration]
     U --> V[Write JSON sidecar and SQLite checkpoint]
 ```
 
-## Why four ASR models are used
+## Four-ASR ensemble
 
-A single ASR model can miss spoken PII. This is especially risky for phone numbers, member IDs, names, addresses, and dates of birth. The final pipeline handles this by separating two jobs:
+Enabled engines are configured here:
 
-```text
-Whisper:
-  transcript + word timestamps
-  used as the timing anchor
+```yaml
+asr:
+  engine_order: [whisper, qwen, cohere, granite]
+  timestamp_anchor_engine: whisper
+  pii_detection_transcript_scope: final_and_all_engines
 
-Qwen, Cohere, Granite:
-  transcript only
-  used to improve final transcript and PII recall
+  engines:
+    whisper:
+      enabled: true
+      kind: faster_whisper
+      model_dir: /mnt/amc-data/pipeline/models/whisper-large-v3
+      use_batched_pipeline: true
+      batch_size: 8
+      beam_size: 1
+      word_timestamps: true
+
+    qwen:
+      enabled: true
+      kind: qwen
+      model_dir: /mnt/amc-data/pipeline/models/qwen3-asr-1.7b
+      batch_size: 2
+
+    cohere:
+      enabled: true
+      kind: cohere
+      model_dir: /mnt/amc-data/pipeline/models/cohere-transcribe-03-2026
+      batch_size: 2
+
+    granite:
+      enabled: true
+      kind: granite
+      model_dir: /mnt/amc-data/pipeline/models/granite-4.0-1b-speech
+      batch_size: 2
 ```
 
-PII detection is run over the final consensus transcript and, by default, every enabled ASR transcript. This is safer than only detecting PII on the final transcript because a minority ASR model may catch an identifier that the consensus text smooths over.
-
-## ASR consensus logic
-
-For each channel:
-
-1. Normalize transcripts from enabled engines.
-2. Accept strict majority when at least `min_agreement` engines agree.
-3. Otherwise choose the soft-similarity center transcript when agreement is good enough.
-4. Otherwise choose the first non-empty transcript from `fallback_priority`.
-5. Run PII detection on the selected final transcript and optionally all enabled model transcripts.
-6. Project PII spans back to Whisper word timestamps.
-7. If an entity cannot be mapped to timestamps, mask the full detected channel by default.
-
-This is intentionally conservative. For de-identification, a false negative is worse than masking too much audio.
-
-## Directory layout
-
-```text
-amc_pii_audio_masking_pipeline_v4_multiasr_optimized/
-  pii_audio_masking_pipeline/
-    asr.py                  # Multi-ASR engines, consensus, timestamp alignment
-    audio_io.py             # FFmpeg decode, encode, masking, copy fast paths
-    config.py               # Config dataclasses and validation
-    manifest.py             # Audio discovery
-    pii_detection.py        # Regex, spoken number, GLiNER, Piiranha, spaCy
-    pipeline.py             # End-to-end file processor
-    run.py                  # CLI entry point
-    state.py                # SQLite resume state
-    timestamp_mapping.py    # Entity-to-word timestamp mapping
-    validation.py           # Output validation
-  tests/
-  config.example.yaml
-  requirements.txt
-  OPTIMIZATION_NOTES.md
-  VERSION.txt
-```
+Whisper supplies timestamps. The other engines improve recall. PII detection runs on the final consensus plus each enabled engine transcript by default.
 
 ## Install
 
 ```bash
-cd amc_pii_audio_masking_pipeline_v4_multiasr_optimized
+cd amc_pii_audio_masking_pipeline_v5_batch_optimized
 pip install -r requirements.txt
+cp config.example.yaml config.yaml
 ```
 
-Optional model-specific dependencies must already be available for the enabled engines:
+Optional dependencies depend on your local model setup:
 
 ```text
-whisper: faster-whisper
-qwen: local qwen_asr package exposing Qwen3ASRModel
-cohere: transformers build that supports Cohere ASR
-Granite: transformers build and local Granite speech model with trust_remote_code support
+qwen_asr package exposing Qwen3ASRModel
+local Cohere speech model code if required by your model folder
+local Granite speech model code if required by your model folder
+spacy + en_core_web_sm only when pii.enable_spacy=true
 ```
 
-Disable engines that are not installed or not available locally.
+## Run
 
-## First run
+Small validation run:
 
 ```bash
-cp config.example.yaml config.yaml
-
 python -m pii_audio_masking_pipeline.run \
   --config config.yaml \
   --stage process \
   --limit 25
 ```
 
-## Enable or disable ASR models
-
-Edit `config.yaml`:
-
-```yaml
-asr:
-  engines:
-    whisper:
-      enabled: true
-    qwen:
-      enabled: true
-    cohere:
-      enabled: true
-    granite:
-      enabled: true
-```
-
-Or use CLI overrides:
-
-```bash
-python -m pii_audio_masking_pipeline.run \
-  --config config.yaml \
-  --stage process \
-  --enable-asr-engines whisper,qwen,cohere,granite
-```
-
-For a faster smoke test using only Whisper:
+Use only Whisper for smoke testing:
 
 ```bash
 python -m pii_audio_masking_pipeline.run \
@@ -189,96 +164,80 @@ python -m pii_audio_masking_pipeline.run \
   --enable-asr-engines whisper
 ```
 
-Keep `whisper` enabled unless another timestamp-capable engine is implemented. The masking stage needs word timestamps.
+Production-style run with four engines and file batching:
 
-## Important speed settings
+```bash
+python -m pii_audio_masking_pipeline.run \
+  --config config.yaml \
+  --stage process \
+  --enable-asr-engines whisper,qwen,cohere,granite \
+  --file-batch-size 2
+```
 
-Recommended default for a large GPU:
+For short clips or already-segmented audio, try a larger file batch:
+
+```bash
+python -m pii_audio_masking_pipeline.run \
+  --config config.yaml \
+  --stage process \
+  --file-batch-size 8 \
+  --file-batch-max-decoded-audio-gb 4
+```
+
+For long full-call audio, keep `file_batch_size` at `1` or `2`. Decoded stereo 48 kHz float32 buffers are held until the micro-batch is finalized.
+
+## Recommended speed config
 
 ```yaml
 asr:
+  mode: per_channel
   input_audio_strategy: single_decode
   model_residency: keep_loaded
   pii_detection_transcript_scope: final_and_all_engines
   engines:
     whisper:
+      enabled: true
+      use_batched_pipeline: true
       batch_size: 8
       beam_size: 1
+      best_of: 1
       vad_filter: true
+      word_timestamps: true
+      condition_on_previous_text: false
     qwen:
+      enabled: true
       batch_size: 2
     cohere:
+      enabled: true
       batch_size: 2
     granite:
+      enabled: true
       batch_size: 2
 
 pii:
   batch_size: 16
+  enable_regex: true
+  enable_spoken_number_rules: true
+  enable_gliner: true
+  enable_piiranha: true
 
 masking:
   mode: silence
   copy_input_if_no_pii: true
+  unmapped_entity_policy: mask_full_channel
 
 runtime:
+  file_batch_size: 2
+  file_batch_max_decoded_audio_gb: 2.0
   copy_unmasked_when_no_pii: true
   unmasked_copy_method: hardlink_or_copy
   atomic_output: true
+  validate_outputs: true
 ```
-
-For small GPUs where four models cannot stay resident:
-
-```yaml
-asr:
-  model_residency: unload_after_file
-```
-
-That is slower, but avoids GPU out-of-memory failures.
-
-## Output sidecar
-
-For each output audio file, the pipeline writes:
-
-```text
-<masked_audio>.pii_masking.json
-```
-
-The sidecar contains:
-
-```text
-input metadata
-final consensus transcript per channel
-per-engine transcripts and errors
-consensus method
-PII entities
-raw mask spans
-merged mask spans
-output validation result
-optimization flags
-```
-
-Set this only for debugging because sidecars become large:
-
-```yaml
-runtime:
-  sidecar_include_words: true
-```
-
-## Output validation
-
-Every generated output is validated with ffprobe:
-
-```text
-codec_name == opus
-sample_rate == 48000
-channels == 2
-duration close to input duration
-```
-
-The pipeline refuses unsafe configs where `output_root` equals `input_root`, and it excludes output/work directories from input discovery.
 
 ## Sharding
 
-Run one shard per worker:
+Run one worker per GPU or machine:
 
 ```bash
 python -m pii_audio_masking_pipeline.run --config config.yaml --stage process --shard-count 4 --shard-index 0
@@ -287,7 +246,37 @@ python -m pii_audio_masking_pipeline.run --config config.yaml --stage process --
 python -m pii_audio_masking_pipeline.run --config config.yaml --stage process --shard-count 4 --shard-index 3
 ```
 
-Use one worker per GPU when all four ASR models are enabled.
+Do not run multiple four-model workers on one small GPU. That usually reduces throughput or causes OOM.
+
+## Output sidecar
+
+Every output gets:
+
+```text
+<masked_audio>.pii_masking.json
+```
+
+The sidecar includes input metadata, consensus transcripts, per-engine transcripts, PII entities, raw spans, merged spans, validation, and optimization flags.
+
+Set this only for debugging:
+
+```yaml
+runtime:
+  sidecar_include_words: true
+```
+
+## Validation and safety guards
+
+The pipeline validates:
+
+```text
+codec_name == opus
+sample_rate == 48000
+channels == 2
+duration close to input duration
+```
+
+It also refuses unsafe output paths, excludes output/work directories from discovery, disallows symlink outputs, uses atomic writes, and masks the full detected channel if PII is found but cannot be timestamp-mapped.
 
 ## Tests
 
@@ -295,16 +284,18 @@ Use one worker per GPU when all four ASR models are enabled.
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q
 ```
 
-Expected result in the packaged validation run:
+Packaged validation result:
 
 ```text
-14 passed
+16 passed
 ```
 
-## Hard constraints
+## Tuning order
 
-- Do not disable word timestamps on the timestamp anchor.
-- Do not set `unmapped_entity_policy: copy_original` for production de-identification.
-- Do not output symlinks for deliverable masked audio.
-- Do not process masked output directories as input.
-- Do not expect transcript-only ASR models to provide accurate masking timestamps. They improve PII text detection, while Whisper supplies timing.
+1. Start with `file_batch_size: 2` and all four ASR engines enabled.
+2. Benchmark 100 representative calls.
+3. Increase Qwen/Cohere/Granite `batch_size` first.
+4. Increase `runtime.file_batch_size` only if RAM stays comfortable.
+5. Increase Whisper `batch_size` only if GPU memory allows it.
+6. Keep Whisper `beam_size: 1` for production masking throughput.
+7. Use `silence` for final ASR training data and `beep` only for audit samples.

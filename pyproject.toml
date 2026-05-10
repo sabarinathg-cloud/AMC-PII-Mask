@@ -1,7 +1,7 @@
 [project]
 name = "amc-pii-audio-masking-pipeline"
-version = "4.0.0"
-description = "Four-ASR optimized stereo Opus speech PII masking pipeline for AMC-style call audio."
+version = "5.0.0"
+description = "Four-ASR, file-batched stereo Opus speech PII masking pipeline for AMC-style call audio."
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.24",

@@ -130,3 +130,47 @@ def test_pii_masking_encodes_masked_output(tmp_path: Path):
     assert meta["codec_name"] == "opus"
     assert meta["sample_rate"] == 48000
     assert meta["channels"] == 2
+
+
+def test_cross_file_batch_no_pii_fast_copy(tmp_path: Path):
+    sr = 48000
+    t = np.arange(sr // 4, dtype=np.float32) / sr
+    audio = np.stack([
+        0.03 * np.sin(2 * np.pi * 440 * t),
+        0.03 * np.sin(2 * np.pi * 660 * t),
+    ], axis=1).astype(np.float32)
+
+    input_root = tmp_path / "input_batch"
+    output_root = tmp_path / "output_batch"
+    work_dir = tmp_path / "work_batch"
+    src1 = input_root / "2024" / "call-a" / "audio.opus"
+    src2 = input_root / "2024" / "call-b" / "audio.opus"
+    encode_float32_stereo_to_opus(audio, src1)
+    encode_float32_stereo_to_opus(audio, src2)
+
+    cfg = load_config(None)
+    cfg.paths.input_root = str(input_root)
+    cfg.paths.output_root = str(output_root)
+    cfg.paths.work_dir = str(work_dir)
+    cfg.runtime.unmasked_copy_method = "copy"
+    cfg.runtime.resume = False
+    cfg.runtime.file_batch_size = 2
+
+    pipe = PIIMaskingPipeline.__new__(PIIMaskingPipeline)
+    pipe.config = cfg
+    pipe.input_root = input_root
+    pipe.output_root = output_root
+    pipe.work_dir = work_dir
+    pipe.asr = FakeASR()
+    pipe.detector = FakeDetector()
+
+    results = pipe.process_files_batch([src1, src2])
+    assert len(results) == 2
+    assert {r["status"] for r in results} == {"success_no_pii_fast_copy"}
+    for r in results:
+        out = Path(r["output_path"])
+        assert out.exists()
+        meta = ffprobe_audio(out)
+        assert meta["codec_name"] == "opus"
+        assert meta["sample_rate"] == 48000
+        assert meta["channels"] == 2
