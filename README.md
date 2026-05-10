@@ -227,12 +227,38 @@ masking:
   unmapped_entity_policy: mask_full_channel
 
 runtime:
+  performance_profile: default
   file_batch_size: 2
   file_batch_max_decoded_audio_gb: 2.0
+  adaptive_file_batching: true
+  adaptive_batch_min_size: 1
+  min_free_gpu_mem_gb: 2.0
+  write_perf_metrics: false
   copy_unmasked_when_no_pii: true
   unmasked_copy_method: hardlink_or_copy
   atomic_output: true
   validate_outputs: true
+```
+
+For a mostly free NVIDIA A10G 24 GB worker, use the built-in profile:
+
+```bash
+python -m pii_audio_masking_pipeline.run \
+  --config config.yaml \
+  --stage process \
+  --performance-profile a10g_24gb
+```
+
+The A10G profile keeps all models loaded, starts `file_batch_size` at `4`, raises the decoded-audio guard to `4 GB`, increases transcript-only ASR batches to at least `4`, increases PII batch size to `32`, enables performance metrics, and keeps adaptive batching on. If VRAM gets tight, adaptive batching shrinks file micro-batches before the next batch.
+
+To benchmark batch sizes without editing config:
+
+```bash
+python scripts/benchmark_matrix.py \
+  --config config.yaml \
+  --limit 25 \
+  --batch-sizes 1,2,4,8 \
+  --performance-profile a10g_24gb
 ```
 
 ## Sharding
@@ -284,10 +310,10 @@ It also refuses unsafe output paths, excludes output/work directories from disco
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q
 ```
 
-Packaged validation result:
+Expected packaged validation result when FFmpeg/ffprobe are available:
 
 ```text
-16 passed
+24 passed
 ```
 
 ## Tuning order

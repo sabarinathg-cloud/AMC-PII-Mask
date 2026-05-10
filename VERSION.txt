@@ -7,5 +7,6 @@ Changes:
 - faster-whisper BatchedInferencePipeline remains the timestamp anchor.
 - Neural PII detection batches across all transcripts in a file batch.
 - Single decode path, no forced alignment, no-PII fast copy, atomic writes, output validation.
+- Optional performance metrics, A10G profile, adaptive batching, and benchmark matrix runner.
 - Conservative full-channel fallback for unmapped PII.
-- Tests: 16 passed.
+- Tests: 24 expected with FFmpeg/ffprobe available.
