@@ -1,0 +1,11 @@
+amc_pii_audio_masking_pipeline_v4_multiasr_optimized
+
+Changes:
+- Four configurable ASR engines: whisper, qwen, cohere, granite.
+- Whisper timestamp anchor for word-level audio masking.
+- Per-channel ASR consensus transcript.
+- PII detection over final consensus plus every enabled ASR transcript by default.
+- Projection of transcript-only ASR entities onto Whisper word timestamps.
+- Conservative full-channel fallback for unmapped PII.
+- CLI overrides for enabling/disabling ASR engines.
+- Tests: 14 passed.

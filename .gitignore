@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+config.yaml
+config.local.yaml
+secrets.*
+credentials.*
+
+# Runtime data, models, and generated outputs
+data/
+input/
+output/
+outputs/
+work/
+work_dir/
+models/
+checkpoints/
+*.sqlite
+*.sqlite3
+*.db
+*.opus
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Local agent state
+.omc/

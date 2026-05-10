@@ -1,0 +1,202 @@
+paths:
+  # Root containing original calls, for example: /mnt/amc-data/2024/<call_id>/audio.opus
+  input_root: /mnt/amc-data
+  input_glob: "**/audio.opus"
+
+  # Masked audio preserves the same relative path under this root.
+  output_root: /mnt/amc-data/pii_masked_audio
+
+  # Checkpoints, manifests, temp files, sidecars, reports.
+  work_dir: /mnt/amc-data/pii_masking_work
+  preserve_relative_path: true
+  force_output_suffix: .opus
+  sidecar_suffix: .pii_masking.json
+
+  # Prevent recursively discovering already masked output files.
+  exclude_output_root_from_discovery: true
+  exclude_work_dir_from_discovery: true
+  extra_exclude_globs: []
+
+asr:
+  # Recommended for two-channel call-center audio.
+  # Each channel is transcribed separately, PII spans are channel-specific, output stays stereo Opus.
+  mode: per_channel
+
+  # Fast path. Decodes original Opus once, creates 16 kHz channel arrays in memory,
+  # then reuses the same 48 kHz buffer for masking.
+  input_audio_strategy: single_decode
+  channel_wav_sample_rate: 16000
+  max_audio_seconds: null
+  single_decode_max_audio_seconds: 1800.0
+
+  # Four-model configurable ASR ensemble.
+  # Keep whisper enabled because it is the timestamp anchor for masking.
+  engine_order: [whisper, qwen, cohere, granite]
+  timestamp_anchor_engine: whisper
+
+  # Fastest when the GPU has enough memory for the enabled models.
+  # Use unload_after_file on small GPUs to avoid OOM, but it is slower.
+  model_residency: keep_loaded
+  fail_on_engine_error: false
+
+  # Safest PII setting: detect on the consensus transcript plus every enabled ASR transcript.
+  # Options: final_only, all_engines_only, final_and_all_engines.
+  pii_detection_transcript_scope: final_and_all_engines
+
+  consensus:
+    min_agreement: 2
+    soft_similarity_threshold: 0.78
+    fallback_priority: [whisper, qwen, cohere, granite]
+    prefer_engine_on_tie: whisper
+
+  engines:
+    whisper:
+      enabled: true
+      kind: faster_whisper
+      model_dir: /mnt/amc-data/pipeline/models/whisper-large-v3
+      device: cuda
+      compute_type: float16
+      language: en
+      use_batched_pipeline: true
+      batch_size: 8
+      beam_size: 1
+      best_of: 1
+      temperature: 0.0
+      vad_filter: true
+      vad_parameters:
+        min_silence_duration_ms: 500
+        speech_pad_ms: 200
+      word_timestamps: true
+      condition_on_previous_text: false
+      initial_prompt: "This is a virtual care or healthcare call. Preserve phone numbers, IDs, names, dates of birth, and addresses accurately."
+      retry_base_on_bad_timestamps: true
+      timestamp_max_drift_sec: 1.0
+
+    qwen:
+      enabled: true
+      kind: qwen
+      model_dir: /mnt/amc-data/pipeline/models/qwen3-asr-1.7b
+      device_map: cuda:0
+      dtype: bfloat16
+      batch_size: 2
+      max_new_tokens: 256
+      language: English
+
+    cohere:
+      enabled: true
+      kind: cohere
+      model_dir: /mnt/amc-data/pipeline/models/cohere-transcribe-03-2026
+      device_map: auto
+      dtype: float16
+      batch_size: 2
+      max_new_tokens: 256
+      language: en
+      punctuation: true
+      local_files_only: true
+
+    granite:
+      enabled: true
+      kind: granite
+      model_dir: /mnt/amc-data/pipeline/models/granite-4.0-1b-speech
+      device_map: auto
+      dtype: bfloat16
+      batch_size: 2
+      max_new_tokens: 256
+      local_files_only: true
+      prompt: "<|audio|>can you transcribe the speech into a written format?"
+
+pii:
+  enable_regex: true
+  enable_spoken_number_rules: true
+  enable_gliner: true
+  enable_piiranha: true
+  enable_spacy: false
+  enable_saved_pii_json: true
+
+  gliner_model: knowledgator/gliner-pii-large-v1.0
+  piiranha_model: iiiorg/piiranha-v1-detect-personal-information
+  spacy_model: en_core_web_sm
+
+  # auto uses CUDA only when GPU memory is large enough to hold ASR plus neural PII models.
+  # For 8 GB GPUs, auto normally keeps PII models on CPU to avoid OOM.
+  device: auto
+  min_gpu_mem_gb_for_neural_pii: 12.0
+  torch_float32_matmul_precision: high
+  batch_size: 16
+
+  gliner_threshold: 0.35
+  piiranha_threshold: 0.45
+  chunk_chars: 1800
+  chunk_overlap_chars: 240
+
+  # false keeps medical vocabulary for ASR training.
+  # true additionally masks diagnoses, medications, lab results, etc.
+  mask_clinical_phi: false
+
+masking:
+  # silence is fastest and cleanest for ASR training. Use beep only for audit runs.
+  mode: silence
+
+  # detected_channel masks only the channel where PII was spoken.
+  # both is more conservative but removes more speech.
+  target_channels: detected_channel
+
+  pad_sec: 0.12
+  min_duration_sec: 0.30
+  merge_gap_sec: 0.05
+
+  beep_freq_hz: 1000.0
+  beep_gain: 0.35
+  noise_gain: 0.03
+  fade_ms: 8
+
+  # If no PII spans are detected and the source is already stereo 48 kHz Opus, copy source to output.
+  copy_input_if_no_pii: true
+
+  # If PII is detected but timestamps cannot be mapped, use mask_full_channel for de-identification safety.
+  # Other options: fail, copy_original. Do not use copy_original for production de-identification.
+  unmapped_entity_policy: mask_full_channel
+
+  # Required output properties.
+  output_sample_rate: 48000
+  output_channels: 2
+  opus_bitrate: 64k
+  preserve_input_bitrate: true
+  opus_application: voip
+  opus_vbr: on
+  opus_compression_level: 5
+  opus_frame_duration_ms: 20
+
+runtime:
+  resume: true
+  limit: null
+  shard_index: 0
+  shard_count: 1
+
+  ffmpeg_path: ffmpeg
+  ffprobe_path: ffprobe
+  ffmpeg_threads: 1
+  num_manifest_workers: 8
+
+  keep_temp: false
+  fail_fast: false
+  log_every: 10
+  write_csv_reports: true
+  validate_outputs: true
+  validate_existing_outputs: true
+
+  # Fast path for clean files. The output is copied or hardlinked only when no PII spans are found.
+  copy_unmasked_when_no_pii: true
+  unmasked_copy_method: hardlink_or_copy
+
+  # Atomic writes avoid corrupt outputs if a worker is killed mid-encode.
+  atomic_output: true
+
+  # False keeps sidecars small. Set true only for debugging timestamp alignment.
+  sidecar_include_words: false
+
+  # Keep CSV memory bounded. Full report is always available as JSONL.
+  max_csv_report_rows: 10000
+
+  delete_failed_partial_outputs: true
+  random_seed: 42

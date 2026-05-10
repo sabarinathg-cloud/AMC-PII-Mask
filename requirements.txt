@@ -1,0 +1,14 @@
+numpy>=1.24
+scipy>=1.10
+pyyaml>=6.0
+faster-whisper>=1.0.0
+torch>=2.1
+gliner>=0.2.13
+transformers>=4.41
+accelerate>=0.30
+pytest>=8.0
+
+# Optional, required only when the matching ASR engine is enabled:
+# qwen_asr package exposing Qwen3ASRModel
+# transformer builds or local code required by Cohere and Granite speech models
+# spacy + en_core_web_sm if pii.enable_spacy=true

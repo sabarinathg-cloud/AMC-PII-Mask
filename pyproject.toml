@@ -1,0 +1,27 @@
+[project]
+name = "amc-pii-audio-masking-pipeline"
+version = "4.0.0"
+description = "Four-ASR optimized stereo Opus speech PII masking pipeline for AMC-style call audio."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "pyyaml>=6.0",
+  "faster-whisper>=1.0.0",
+  "torch>=2.1",
+  "gliner>=0.2.13",
+  "transformers>=4.41",
+  "accelerate>=0.30",
+]
+
+[project.optional-dependencies]
+spacy = ["spacy>=3.7"]
+test = ["pytest>=8.0"]
+# qwen/cohere/granite model packages are intentionally not pinned because they are local-model dependent.
+
+[project.scripts]
+amc-pii-mask = "pii_audio_masking_pipeline.run:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
