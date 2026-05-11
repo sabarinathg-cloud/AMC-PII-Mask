@@ -1017,60 +1017,65 @@ class MultiASRTranscriber:
         return grouped.get(self._SINGLE_FILE_ID, [])
 
     def _bundle_results_by_file(self, results: Sequence[ASRResult], asr_inputs: Sequence[dict]) -> Dict[str, List[ChannelASRBundle]]:
-        file_channel_order: Dict[str, list[int]] = {}
-        by_key: Dict[tuple[str, int], List[ASRResult]] = {}
+        return bundle_asr_results_by_file(results, asr_inputs, self.cfg)
 
-        for item in asr_inputs:
-            file_id = str(item.get("file_id", self._SINGLE_FILE_ID))
-            channel = int(item["channel"])
-            file_channel_order.setdefault(file_id, [])
-            if channel not in file_channel_order[file_id]:
-                file_channel_order[file_id].append(channel)
-            by_key.setdefault((file_id, channel), [])
 
-        for r in results:
-            file_id = str(getattr(r, "file_id", None) or self._SINGLE_FILE_ID)
-            channel = int(r.channel)
-            by_key.setdefault((file_id, channel), []).append(r)
-            file_channel_order.setdefault(file_id, [])
-            if channel not in file_channel_order[file_id]:
-                file_channel_order[file_id].append(channel)
+def bundle_asr_results_by_file(results: Sequence[ASRResult], asr_inputs: Sequence[dict], cfg: Any) -> Dict[str, List[ChannelASRBundle]]:
+    file_channel_order: Dict[str, list[int]] = {}
+    by_key: Dict[tuple[str, int], List[ASRResult]] = {}
 
-        consensus_cfg = dict(_cfg_get(self.cfg, "consensus", {}) or {})
-        anchor_name = str(_cfg_get(self.cfg, "timestamp_anchor_engine", "whisper"))
-        grouped: Dict[str, List[ChannelASRBundle]] = {}
+    for item in asr_inputs:
+        file_id = str(item.get("file_id", MultiASRTranscriber._SINGLE_FILE_ID))
+        channel = int(item["channel"])
+        file_channel_order.setdefault(file_id, [])
+        if channel not in file_channel_order[file_id]:
+            file_channel_order[file_id].append(channel)
+        by_key.setdefault((file_id, channel), [])
 
-        for file_id, channels in file_channel_order.items():
-            bundles: list[ChannelASRBundle] = []
-            for channel in sorted(channels):
-                rows = by_key.get((file_id, channel), [])
-                consensus = build_consensus(rows, consensus_cfg)
-                final_transcript = str(consensus.get("final_transcript") or "").strip()
+    for r in results:
+        file_id = str(getattr(r, "file_id", None) or MultiASRTranscriber._SINGLE_FILE_ID)
+        channel = int(r.channel)
+        by_key.setdefault((file_id, channel), []).append(r)
+        file_channel_order.setdefault(file_id, [])
+        if channel not in file_channel_order[file_id]:
+            file_channel_order[file_id].append(channel)
 
-                anchor = next((r for r in rows if r.engine == anchor_name and r.words), None)
-                if anchor is None:
-                    anchor = next((r for r in rows if r.words), None)
-                anchor_words = [dict(w, engine=getattr(anchor, "engine", anchor_name)) for w in (anchor.words if anchor else [])]
-                anchor_engine = anchor.engine if anchor else None
+    consensus_cfg = dict(_cfg_get(cfg, "consensus", {}) or {})
+    anchor_name = str(_cfg_get(cfg, "timestamp_anchor_engine", "whisper"))
+    grouped: Dict[str, List[ChannelASRBundle]] = {}
 
-                selected_engine = consensus.get("selected_engine")
-                selected = next((r for r in rows if r.engine == selected_engine), None)
-                if selected is not None and selected.words and selected.transcript.strip() == final_transcript:
-                    final_words = selected.words
-                elif anchor is not None and anchor.transcript.strip() == final_transcript and anchor.words:
-                    final_words = anchor.words
-                else:
-                    final_words = align_transcript_to_timed_words(final_transcript, anchor_words, channel=channel)
+    for file_id, channels in file_channel_order.items():
+        bundles: list[ChannelASRBundle] = []
+        for channel in sorted(channels):
+            rows = by_key.get((file_id, channel), [])
+            consensus = build_consensus(rows, consensus_cfg)
+            final_transcript = str(consensus.get("final_transcript") or "").strip()
 
-                bundles.append(ChannelASRBundle(
-                    file_id=file_id,
-                    channel=channel,
-                    final_transcript=final_transcript,
-                    final_words=final_words,
-                    engine_results=rows,
-                    anchor_engine=anchor_engine,
-                    anchor_words=anchor_words,
-                    consensus=consensus,
-                ))
-            grouped[file_id] = bundles
-        return grouped
+            anchor = next((r for r in rows if r.engine == anchor_name and r.words), None)
+            if anchor is None:
+                anchor = next((r for r in rows if r.words), None)
+            anchor_words = [dict(w, engine=getattr(anchor, "engine", anchor_name)) for w in (anchor.words if anchor else [])]
+            anchor_engine = anchor.engine if anchor else None
+
+            selected_engine = consensus.get("selected_engine")
+            selected = next((r for r in rows if r.engine == selected_engine), None)
+            if selected is not None and selected.words and selected.transcript.strip() == final_transcript:
+                final_words = selected.words
+            elif anchor is not None and anchor.transcript.strip() == final_transcript and anchor.words:
+                final_words = anchor.words
+            else:
+                final_words = align_transcript_to_timed_words(final_transcript, anchor_words, channel=channel)
+
+            bundles.append(ChannelASRBundle(
+                file_id=file_id,
+                channel=channel,
+                final_transcript=final_transcript,
+                final_words=final_words,
+                engine_results=rows,
+                anchor_engine=anchor_engine,
+                anchor_words=anchor_words,
+                consensus=consensus,
+            ))
+        grouped[file_id] = bundles
+    return grouped
+

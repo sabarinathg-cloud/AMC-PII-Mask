@@ -64,7 +64,10 @@ def _summarize(rows: list[dict[str, Any]], elapsed_sec: float, batch_size: int) 
     peak_free_gpu_gb = None
     min_free_gpu_gb = None
     for row in rows:
-        for sample in ((row.get("perf_metrics") or {}).get("cuda_memory") or []):
+        perf_metrics = row.get("perf_metrics") or {}
+        if not perf_metrics and row.get("perf_metrics_json"):
+            perf_metrics = json.loads(row["perf_metrics_json"])
+        for sample in ((perf_metrics or {}).get("cuda_memory") or []):
             if not sample.get("available"):
                 continue
             free_gb = float(sample.get("free_gb", 0.0))
@@ -91,6 +94,7 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=25)
     parser.add_argument("--batch-sizes", type=_parse_batch_sizes, default=[1, 2, 4, 8])
     parser.add_argument("--performance-profile", choices=["default", "a10g_24gb"], default=None)
+    parser.add_argument("--pipeline-schedule", choices=["file_major", "model_major"], default=None)
     parser.add_argument("--enable-asr-engines", default=None)
     parser.add_argument("--disable-asr-engines", default=None)
     parser.add_argument("--extra-arg", action="append", default=[], help="Extra argument passed through to the pipeline command.")
@@ -116,6 +120,8 @@ def main() -> int:
         ]
         if args.performance_profile:
             cmd.extend(["--performance-profile", args.performance_profile])
+        if args.pipeline_schedule:
+            cmd.extend(["--pipeline-schedule", args.pipeline_schedule])
         if args.enable_asr_engines:
             cmd.extend(["--enable-asr-engines", args.enable_asr_engines])
         if args.disable_asr_engines:

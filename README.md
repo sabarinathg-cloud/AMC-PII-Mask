@@ -29,6 +29,8 @@ This version uses batching at every practical layer:
 
 Important detail: Whisper is not cross-file batched because it is the timestamp anchor and faster-whisper does not reliably accept independent audio arrays as one list input. It uses `BatchedInferencePipeline`, which batches internal chunks. Qwen, Cohere, Granite, and neural PII detection are cross-file batched.
 
+For very large single-GPU jobs, `runtime.pipeline_schedule: model_major` is also available. It runs one ASR model across the corpus, saves that model's per-channel transcripts/timestamps in SQLite, unloads and clears accelerator memory, then runs the next model. After all ASR passes complete, the pipeline builds consensus, detects PII, and masks audio from the cached ASR results.
+
 ## Pipeline flow
 
 ```mermaid
@@ -228,6 +230,7 @@ masking:
 
 runtime:
   performance_profile: default
+  pipeline_schedule: file_major
   file_batch_size: 2
   file_batch_max_decoded_audio_gb: 2.0
   adaptive_file_batching: true
@@ -250,6 +253,19 @@ python -m pii_audio_masking_pipeline.run \
 ```
 
 The A10G profile keeps all models loaded, starts `file_batch_size` at `4`, raises the decoded-audio guard to `4 GB`, increases transcript-only ASR batches to at least `4`, increases PII batch size to `32`, enables performance metrics, and keeps adaptive batching on. If VRAM gets tight, adaptive batching shrinks file micro-batches before the next batch.
+
+For the lower-VRAM model-major schedule:
+
+```bash
+python -m pii_audio_masking_pipeline.run \
+  --config config.yaml \
+  --stage process \
+  --performance-profile a10g_24gb \
+  --pipeline-schedule model_major
+```
+
+This creates `asr_results_shard*_of_*.sqlite` under `paths.work_dir` and resumes individual model/channel ASR results on rerun.
+That cache contains raw ASR transcripts, so it is created with private file permissions. Add `--delete-asr-cache-after-finalize` or set `runtime.delete_asr_cache_after_finalize: true` when you do not need to keep it for crash recovery.
 
 To benchmark batch sizes without editing config:
 
