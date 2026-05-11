@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import inspect
 import importlib
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -62,14 +63,12 @@ class WhisperXForcedAligner:
         waveform = np.asarray(audio, dtype=np.float32).reshape(-1)
         duration_sec = float(waveform.shape[0]) / float(sample_rate) if sample_rate else 0.0
         segments = [{"text": text, "start": 0.0, "end": max(duration_sec, 0.0)}]
-        result = self._whisperx.align(
+        result = self._call_align(
             segments,
             model,
             metadata,
             waveform,
             resolved_device,
-            batch_size=int(self.batch_size),
-            return_char_alignments=False,
         )
         aligned_words = build_canonical_aligned_words(
             transcript=text,
@@ -100,6 +99,22 @@ class WhisperXForcedAligner:
             model, metadata = self._whisperx.load_align_model(language_code=language, device=device)
             self._model_cache[cache_key] = (model, metadata)
         return self._model_cache[cache_key]
+
+    def _call_align(self, segments: list[dict], model: Any, metadata: dict, waveform: np.ndarray, device: str) -> Any:
+        kwargs: dict[str, Any] = {
+            "batch_size": int(self.batch_size),
+            "return_char_alignments": False,
+        }
+        try:
+            signature = inspect.signature(self._whisperx.align)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is not None and not any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ):
+            kwargs = {key: value for key, value in kwargs.items() if key in signature.parameters}
+        return self._whisperx.align(segments, model, metadata, waveform, device, **kwargs)
 
     def _normalize_language(self, language: Optional[str]) -> str:
         value = str(language or self.default_language or "en").strip().lower()
