@@ -204,6 +204,10 @@ class MaskingConfig:
     output_channels: int = 2
     opus_bitrate: str = "64k"
     preserve_input_bitrate: bool = True
+    # libopus stereo refuses very low rates (e.g. 16k) and FFmpeg's encoder pipe
+    # closes with a BrokenPipe before any audio is consumed. We floor the resolved
+    # bitrate to keep encodes valid for low-bitrate sources (e.g. 15 kb/s VoIP).
+    opus_min_bitrate_kbps: int = 24
     opus_application: str = "voip"
     opus_vbr: str = "on"
     opus_compression_level: int = 5
@@ -409,6 +413,8 @@ def validate_config(config: PipelineConfig) -> PipelineConfig:
         raise ValueError("masking.unmapped_entity_policy='copy_original' is unsafe for de-identification")
     if float(config.masking.pad_sec) < 0 or float(config.masking.min_duration_sec) < 0:
         raise ValueError("masking.pad_sec and masking.min_duration_sec must be non-negative")
+    if int(getattr(config.masking, "opus_min_bitrate_kbps", 24)) < 6:
+        raise ValueError("masking.opus_min_bitrate_kbps must be >= 6 to keep libopus encodes valid")
 
     if int(config.pii.batch_size) < 1:
         raise ValueError("pii.batch_size must be >= 1")
