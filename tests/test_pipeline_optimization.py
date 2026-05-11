@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import wave
 
 import numpy as np
 import pytest
@@ -11,6 +12,7 @@ import pii_audio_masking_pipeline.utils as utils_module
 from pii_audio_masking_pipeline.asr import ASRResult, ChannelASRBundle, build_consensus
 from pii_audio_masking_pipeline.audio_io import AudioCommandError, encode_float32_stereo_to_opus
 from pii_audio_masking_pipeline.config import load_config
+from pii_audio_masking_pipeline.forced_alignment import AlignmentResult
 from pii_audio_masking_pipeline.pipeline import PIIMaskingPipeline
 from pii_audio_masking_pipeline.timestamp_mapping import merge_spans
 from pii_audio_masking_pipeline.utils import write_json
@@ -103,6 +105,57 @@ class EmptyDetector:
         return [[] for _ in texts]
 
 
+class SingleEntityDetector:
+    def detect_batch(self, texts, rows=None):
+        out = []
+        for text in texts:
+            start = str(text).index("John")
+            out.append([{
+                "text": "John",
+                "type": "PERSON_NAME",
+                "start": start,
+                "end": start + 4,
+                "score": 0.99,
+                "source": "test",
+            }])
+        return out
+
+
+class StaticAligner:
+    backend = "whisperx"
+
+    def __init__(self, result: AlignmentResult):
+        self.result = result
+
+    def align(self, **kwargs):
+        return self.result
+
+
+class LegacyPathASR:
+    def transcribe_path(self, wav_path: Path, channel: int):
+        return ASRResult(channel=channel, transcript="hello John", words=[], engine="legacy", language="en")
+
+
+def _write_silent_wav(path: Path, sample_rate: int = 16000) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    samples = np.zeros(sample_rate // 10, dtype=np.int16)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(samples.tobytes())
+
+
+def _write_silent_float_wav(path: Path, sample_rate: int = 16000) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    samples = np.zeros(sample_rate // 10, dtype=np.float32)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(4)
+        wf.setframerate(sample_rate)
+        wf.writeframes(samples.tobytes())
+
+
 def test_process_files_batch_reuses_ffprobe_metadata(monkeypatch, tmp_path: Path):
     pipe = _pipe(tmp_path)
     pipe.asr = BatchASR()
@@ -143,6 +196,275 @@ def test_process_files_batch_reuses_ffprobe_metadata(monkeypatch, tmp_path: Path
 
     assert [r["status"] for r in results] == ["success", "success"]
     assert calls == paths
+
+
+def test_temp_wav_transcribe_path_passes_audio_to_forced_alignment(monkeypatch, tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    pipe.asr = LegacyPathASR()
+    pipe.forced_aligner = StaticAligner(AlignmentResult(
+        status="aligned",
+        words=[],
+        coverage=0.0,
+        backend="whisperx",
+        language="en",
+        aligned_word_count=0,
+        transcript_word_count=0,
+    ))
+    pipe.config.asr.mode = "per_channel"
+    captured = {}
+
+    def fake_extract_channel_wav(input_path, wav_path, **kwargs):
+        _write_silent_wav(Path(wav_path), sample_rate=int(kwargs["sample_rate"]))
+
+    def fake_handle(self, results, transcripts, all_entities, raw_spans, row, duration, alignment_audio_by_channel=None):
+        captured["alignment_audio_by_channel"] = alignment_audio_by_channel
+        return False
+
+    monkeypatch.setattr(pipeline_module, "extract_channel_wav", fake_extract_channel_wav)
+    monkeypatch.setattr(PIIMaskingPipeline, "_handle_asr_results", fake_handle)
+
+    pipe._process_with_temp_wavs(
+        input_path=tmp_path / "input" / "audio.opus",
+        channel_count=1,
+        row=None,
+        duration=1.0,
+        transcripts=[],
+        all_entities=[],
+        raw_spans=[],
+    )
+
+    alignment_audio = captured["alignment_audio_by_channel"][0]
+    assert alignment_audio["sample_rate"] == 16000
+    assert alignment_audio["audio"].dtype == np.float32
+    assert alignment_audio["audio"].shape[0] > 0
+
+
+def test_read_wav_float32_rejects_non_pcm16_alignment_audio(tmp_path: Path):
+    wav_path = tmp_path / "float.wav"
+    _write_silent_float_wav(wav_path)
+
+    with pytest.raises(ValueError, match="16-bit PCM"):
+        PIIMaskingPipeline._read_wav_float32(wav_path)
+
+
+def test_handle_asr_bundles_uses_forced_aligned_words_for_pii_spans(tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    pipe.detector = SingleEntityDetector()
+    pipe.forced_aligner = StaticAligner(AlignmentResult(
+        status="aligned",
+        words=[
+            {"word": "hello", "start": 0.0, "end": 0.2, "start_char": 0, "end_char": 5, "channel": 0, "timestamp_source": "forced_alignment", "probability": 0.8},
+            {"word": "John", "start": 1.0, "end": 1.3, "start_char": 6, "end_char": 10, "channel": 0, "timestamp_source": "forced_alignment", "probability": 0.6},
+        ],
+        coverage=1.0,
+        backend="whisperx",
+        language="en",
+        aligned_word_count=2,
+        transcript_word_count=2,
+    ))
+    asr_words = [
+        {"word": "hello", "start": 9.0, "end": 9.2, "start_char": 0, "end_char": 5, "channel": 0},
+        {"word": "John", "start": 9.3, "end": 9.5, "start_char": 6, "end_char": 10, "channel": 0},
+    ]
+    result = ASRResult(channel=0, transcript="hello John", words=asr_words, engine="whisper", language="en")
+    bundle = ChannelASRBundle(
+        channel=0,
+        final_transcript="hello John",
+        final_words=asr_words,
+        engine_results=[result],
+        anchor_engine="whisper",
+        anchor_words=asr_words,
+        consensus={"selected_engine": "whisper"},
+    )
+    transcripts: list[dict] = []
+    all_entities: list[dict] = []
+    raw_spans: list[dict] = []
+
+    pipe._handle_asr_bundles(
+        [bundle],
+        transcripts,
+        all_entities,
+        raw_spans,
+        row=None,
+        duration=20.0,
+        alignment_audio_by_channel={0: {"audio": np.zeros(16000, dtype=np.float32), "sample_rate": 16000}},
+    )
+
+    assert raw_spans[0]["start"] == pytest.approx(0.88)
+    assert raw_spans[0]["timestamp_source"] == "forced_alignment"
+    assert raw_spans[0]["entity_id"] == "ent_000001"
+    assert transcripts[0]["transcript_confidence"] == pytest.approx(0.7)
+    assert transcripts[0]["confidence_method"] == "mean_word_probability"
+    assert transcripts[0]["words"][1]["probability"] == 0.6
+
+
+def test_low_forced_alignment_coverage_uses_full_channel_fallback(tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    pipe.config.alignment.min_aligned_words_ratio = 0.75
+    pipe.detector = SingleEntityDetector()
+    pipe.forced_aligner = StaticAligner(AlignmentResult(
+        status="aligned",
+        words=[],
+        coverage=0.0,
+        backend="whisperx",
+        language="en",
+        aligned_word_count=0,
+        transcript_word_count=2,
+    ))
+    asr_words = [
+        {"word": "hello", "start": 0.0, "end": 0.2, "start_char": 0, "end_char": 5, "channel": 0},
+        {"word": "John", "start": 0.3, "end": 0.5, "start_char": 6, "end_char": 10, "channel": 0},
+    ]
+    result = ASRResult(channel=0, transcript="hello John", words=asr_words, engine="whisper", language="en")
+    bundle = ChannelASRBundle(
+        channel=0,
+        final_transcript="hello John",
+        final_words=asr_words,
+        engine_results=[result],
+        anchor_engine="whisper",
+        anchor_words=asr_words,
+        consensus={"selected_engine": "whisper"},
+    )
+    raw_spans: list[dict] = []
+
+    transcripts: list[dict] = []
+    all_entities: list[dict] = []
+    used_fallback = pipe._handle_asr_bundles(
+        [bundle],
+        transcripts=transcripts,
+        all_entities=all_entities,
+        raw_spans=raw_spans,
+        row=None,
+        duration=5.0,
+        alignment_audio_by_channel={0: {"audio": np.zeros(16000, dtype=np.float32), "sample_rate": 16000}},
+    )
+
+    assert used_fallback is True
+    assert raw_spans[0]["type"] == "UNMAPPED_PII_FALLBACK"
+    assert raw_spans[0]["start"] == 0.0
+    assert raw_spans[0]["end"] == 5.0
+    assert raw_spans[0]["timestamp_source"] == "forced_alignment_fallback_full_channel"
+    assert raw_spans[0]["alignment_backend"] == "whisperx"
+    assert transcripts[0]["words"] == asr_words
+    assert transcripts[0]["alignment_status"] == "low_coverage_fallback_full_channel"
+
+
+def test_non_bundle_alignment_fallback_preserves_asr_words_in_sidecar(tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    pipe.detector = SingleEntityDetector()
+    pipe.forced_aligner = StaticAligner(AlignmentResult(
+        status="unaligned",
+        words=[],
+        coverage=0.0,
+        backend="whisperx",
+        language="en",
+        aligned_word_count=0,
+        transcript_word_count=2,
+    ))
+    asr_words = [
+        {"word": "hello", "start": 0.0, "end": 0.2, "start_char": 0, "end_char": 5, "channel": 0},
+        {"word": "John", "start": 0.3, "end": 0.5, "start_char": 6, "end_char": 10, "channel": 0},
+    ]
+    result = ASRResult(channel=0, transcript="hello John", words=asr_words, engine="legacy", language="en")
+    transcripts: list[dict] = []
+    all_entities: list[dict] = []
+    raw_spans: list[dict] = []
+
+    pipe._handle_asr_results(
+        [result],
+        transcripts=transcripts,
+        all_entities=all_entities,
+        raw_spans=raw_spans,
+        row=None,
+        duration=5.0,
+        alignment_audio_by_channel={0: {"audio": np.zeros(16000, dtype=np.float32), "sample_rate": 16000}},
+    )
+
+    assert transcripts[0]["words"] == asr_words
+    assert transcripts[0]["alignment_status"] == "low_coverage_fallback_full_channel"
+    assert raw_spans[0]["timestamp_source"] == "forced_alignment_fallback_full_channel"
+
+
+def test_use_asr_words_with_empty_words_degrades_to_full_channel_fallback(tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    pipe.config.alignment.on_failure = "use_asr_words"
+    pipe.detector = SingleEntityDetector()
+    pipe.forced_aligner = StaticAligner(AlignmentResult(
+        status="unaligned",
+        words=[],
+        coverage=0.0,
+        backend="whisperx",
+        language="en",
+        aligned_word_count=0,
+        transcript_word_count=2,
+    ))
+    result = ASRResult(channel=0, transcript="hello John", words=[], engine="legacy", language="en")
+    raw_spans: list[dict] = []
+
+    pipe._handle_asr_results(
+        [result],
+        transcripts=[],
+        all_entities=[],
+        raw_spans=raw_spans,
+        row=None,
+        duration=5.0,
+        alignment_audio_by_channel={0: {"audio": np.zeros(16000, dtype=np.float32), "sample_rate": 16000}},
+    )
+
+    assert raw_spans[0]["type"] == "UNMAPPED_PII_FALLBACK"
+    assert raw_spans[0]["timestamp_source"] == "forced_alignment_fallback_full_channel"
+    assert raw_spans[0]["alignment_backend"] == "whisperx"
+
+
+def test_enabled_alignment_requires_whisperx_dependency(monkeypatch, tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    pipe.config.alignment.enabled = True
+    monkeypatch.setattr(pipeline_module.importlib.util, "find_spec", lambda name: None if name == "whisperx" else object())
+
+    with pytest.raises(ImportError, match="pip install whisperx"):
+        pipe._create_forced_aligner()
+
+
+def test_model_major_alignment_audio_infers_channels_from_cached_results(monkeypatch, tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    pipe.forced_aligner = StaticAligner(AlignmentResult(
+        status="aligned",
+        words=[],
+        coverage=0.0,
+        backend="whisperx",
+        language="en",
+        aligned_word_count=0,
+        transcript_word_count=0,
+    ))
+    captured = {}
+
+    def fake_decode(*args, **kwargs):
+        return np.zeros((48000, 2), dtype=np.float32)
+
+    def fake_make_asr_audio_inputs(audio, mode, input_channels, **kwargs):
+        captured["input_channels"] = input_channels
+        return [
+            {"channel": 0, "audio": np.zeros(16000, dtype=np.float32), "sample_rate": 16000},
+            {"channel": 1, "audio": np.zeros(16000, dtype=np.float32), "sample_rate": 16000},
+        ][:input_channels]
+
+    monkeypatch.setattr(pipeline_module, "decode_to_float32_stereo_48k", fake_decode)
+    monkeypatch.setattr(pipeline_module, "make_asr_audio_inputs", fake_make_asr_audio_inputs)
+    monkeypatch.setattr(PIIMaskingPipeline, "_should_skip_existing", lambda *args, **kwargs: False)
+    monkeypatch.setattr(PIIMaskingPipeline, "_bundles_from_cached_asr_results", lambda *args, **kwargs: [])
+    monkeypatch.setattr(PIIMaskingPipeline, "_handle_asr_bundles", lambda *args, **kwargs: False)
+    monkeypatch.setattr(PIIMaskingPipeline, "_finalize_outputs", lambda self, **kwargs: {"status": "success"})
+
+    pipe.process_file_from_asr_results(
+        tmp_path / "input" / "audio.opus",
+        asr_results=[
+            ASRResult(channel=0, transcript="a", words=[], engine="whisper"),
+            ASRResult(channel=1, transcript="b", words=[], engine="whisper"),
+        ],
+        meta={"duration_sec": 1.0},
+    )
+
+    assert captured["input_channels"] == 2
 
 
 def test_adaptive_batch_size_shrinks_when_free_gpu_memory_is_low(tmp_path: Path):
@@ -297,6 +619,84 @@ def test_sidecar_includes_pii_detector_coverage_and_masking_audit(tmp_path: Path
     assert sidecar["masking_audit"]["entity_ids_with_full_channel_fallback"] == ["ent_000002"]
     assert sidecar["masking_audit"]["entity_ids_without_masking"] == []
     assert sidecar["masking_audit"]["all_detected_entities_masked"] is True
+
+
+def test_sidecar_records_forced_alignment_status_and_masking_provenance(tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    transcripts = [{
+        "channel": 0,
+        "engine": "consensus",
+        "transcript": "hello John",
+        "final_transcript": "hello John",
+        "word_count": 2,
+        "alignment_status": "aligned",
+        "alignment_backend": "whisperx",
+        "alignment_coverage": 1.0,
+        "alignment_word_count": 2,
+        "timestamp_source": "forced_alignment",
+    }]
+    sidecar = pipe._build_sidecar(
+        input_path=tmp_path / "input" / "audio.opus",
+        output_path=tmp_path / "output" / "audio.opus",
+        meta={"duration_sec": 2.0},
+        elapsed=0.1,
+        transcripts=transcripts,
+        all_entities=[],
+        raw_spans=[{"timestamp_source": "forced_alignment", "alignment_backend": "whisperx"}],
+        merged_spans=[{"timestamp_source": "forced_alignment", "alignment_backend": "whisperx"}],
+        validation={"valid": True},
+        status="success",
+        used_single_decode=True,
+        used_combined_channel_extract=False,
+        unmapped_fallback_used=False,
+        no_pii_fast_copy_used=False,
+    )
+
+    assert sidecar["alignment"]["enabled"] is True
+    assert sidecar["alignment"]["backend"] == "whisperx"
+    assert sidecar["alignment"]["status"] == "aligned"
+    assert sidecar["alignment"]["transcript_count"] == 1
+    assert sidecar["alignment"]["forced_alignment_span_count"] == 1
+    assert sidecar["alignment"]["full_channel_fallback_span_count"] == 0
+    assert sidecar["alignment"]["asr_words_span_count"] == 0
+    assert sidecar["optimizations"]["forced_alignment"] is True
+    assert sidecar["transcripts"][0]["alignment_coverage"] == 1.0
+
+
+def test_alignment_audit_classifies_missing_audio_as_degraded_for_asr_word_fallback(tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    transcripts = [{
+        "channel": 0,
+        "engine": "consensus",
+        "transcript": "hello John",
+        "final_transcript": "hello John",
+        "alignment_status": "missing_audio_used_asr_words",
+        "alignment_backend": "whisperx",
+        "timestamp_source": "asr_words",
+    }]
+    audit = pipe._alignment_audit(
+        transcripts,
+        raw_spans=[{"timestamp_source": "asr_words", "alignment_backend": "whisperx"}],
+    )
+
+    assert audit["status"] == "degraded"
+    assert audit["asr_words_span_count"] == 1
+
+
+def test_alignment_audit_reports_disabled_when_all_rows_are_disabled(tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    transcripts = [{
+        "channel": 0,
+        "engine": "consensus",
+        "transcript": "hello",
+        "final_transcript": "hello",
+        "alignment_status": "disabled",
+        "timestamp_source": "asr_words",
+    }]
+
+    audit = pipe._alignment_audit(transcripts, raw_spans=[])
+
+    assert audit["status"] == "disabled"
 
 
 def test_write_json_creates_private_sidecar_file(tmp_path: Path):

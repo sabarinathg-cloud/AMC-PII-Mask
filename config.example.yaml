@@ -105,6 +105,19 @@ asr:
       local_files_only: true
       prompt: "<|audio|>can you transcribe the speech into a written format?"
 
+alignment:
+  # High-accuracy forced alignment runs after ASR and before PII timestamp mapping.
+  # If alignment cannot confidently map detected text to timestamps, the default
+  # fallback masks the full detected channel rather than leaving PII unmasked.
+  enabled: true
+  backend: whisperx
+  device: auto
+  compute_type: float16
+  batch_size: 16
+  on_failure: fallback_full_channel
+  min_aligned_words_ratio: 0.70
+  default_language: en
+
 pii:
   enable_regex: true
   enable_spoken_number_rules: true

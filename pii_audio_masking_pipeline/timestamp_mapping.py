@@ -55,8 +55,26 @@ def entities_to_spans(
             "entity_id": ent.get("entity_id"),
             "asr_engine": ent.get("asr_engine"),
             "transcript_source": ent.get("transcript_source"),
+            "timestamp_source": ent.get("timestamp_source") or _timestamp_source_for_words(matched),
+            "alignment_backend": ent.get("alignment_backend") or _alignment_backend_for_words(matched),
         })
     return spans
+
+
+def _timestamp_source_for_words(words: List[Dict[str, Any]]) -> str:
+    sources = {str(w.get("timestamp_source")) for w in words if w.get("timestamp_source")}
+    if "forced_alignment" in sources:
+        return "forced_alignment"
+    if sources:
+        return sorted(sources)[0]
+    return "asr_words"
+
+
+def _alignment_backend_for_words(words: List[Dict[str, Any]]) -> str | None:
+    backends = {str(w.get("alignment_backend")) for w in words if w.get("alignment_backend")}
+    if not backends:
+        return None
+    return sorted(backends)[0]
 
 
 def merge_spans(spans: Iterable[dict], merge_gap_sec: float = 0.05, target_channels: str = "detected_channel") -> List[Dict[str, Any]]:

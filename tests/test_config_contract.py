@@ -24,6 +24,12 @@ def test_config_example_exposes_pipeline_runtime_contract():
     assert cfg.runtime.min_free_gpu_mem_gb == 2.0
     assert cfg.runtime.performance_profile == "default"
     assert cfg.runtime.pipeline_schedule == "file_major"
+    assert cfg.alignment.enabled is True
+    assert cfg.alignment.backend == "whisperx"
+    assert cfg.alignment.device == "auto"
+    assert cfg.alignment.compute_type == "float16"
+    assert cfg.alignment.on_failure == "fallback_full_channel"
+    assert cfg.alignment.min_aligned_words_ratio == 0.70
 
 
 def test_output_path_refuses_same_input_path_configuration(tmp_path):
@@ -69,4 +75,18 @@ def test_unknown_pipeline_schedule_is_rejected():
     cfg = load_config(None)
     cfg.runtime.pipeline_schedule = "sideways"
     with pytest.raises(ValueError, match="pipeline_schedule"):
+        validate_config(cfg)
+
+
+def test_unknown_alignment_backend_is_rejected():
+    cfg = load_config(None)
+    cfg.alignment.backend = "mystery"
+    with pytest.raises(ValueError, match="alignment.backend"):
+        validate_config(cfg)
+
+
+def test_unknown_alignment_failure_policy_is_rejected():
+    cfg = load_config(None)
+    cfg.alignment.on_failure = "copy_original"
+    with pytest.raises(ValueError, match="alignment.on_failure"):
         validate_config(cfg)

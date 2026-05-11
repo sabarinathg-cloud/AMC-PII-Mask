@@ -4,10 +4,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 import hashlib
+import importlib.util
 import json
 import logging
 import tempfile
 import time
+import wave
+
+import numpy as np
 
 from .asr import ASRResult, ChannelASRBundle, MultiASRTranscriber, align_transcript_to_timed_words, bundle_asr_results_by_file
 from .audio_io import (
@@ -23,6 +27,7 @@ from .audio_io import (
     make_asr_audio_inputs,
     write_mono_wav_pcm16,
 )
+from .forced_alignment import AlignmentResult, WhisperXForcedAligner
 from .pii_detection import PIIDetector
 from .timestamp_mapping import entities_to_spans, merge_spans
 from .utils import ensure_dir, stable_relative_path, write_json
@@ -43,7 +48,26 @@ class PIIMaskingPipeline:
                 "Treat sidecars as sensitive PII/PHI artifacts."
             )
         self.asr = MultiASRTranscriber(config.asr)
+        self.forced_aligner = self._create_forced_aligner()
         self.detector = PIIDetector(config.pii)
+
+    def _create_forced_aligner(self):
+        align_cfg = getattr(self.config, "alignment", None)
+        if align_cfg is None or not bool(getattr(align_cfg, "enabled", False)):
+            return None
+        if str(getattr(align_cfg, "backend", "whisperx")) != "whisperx":
+            raise ValueError(f"Unsupported alignment backend: {getattr(align_cfg, 'backend', None)}")
+        if importlib.util.find_spec("whisperx") is None:
+            raise ImportError(
+                "alignment.enabled=true requires the optional whisperx package. "
+                "Install it with `python3 -m pip install whisperx` or set alignment.enabled=false."
+            )
+        return WhisperXForcedAligner(
+            device=str(getattr(align_cfg, "device", "auto")),
+            compute_type=str(getattr(align_cfg, "compute_type", "float16")),
+            batch_size=int(getattr(align_cfg, "batch_size", 16)),
+            default_language=str(getattr(align_cfg, "default_language", "en")),
+        )
 
     def _perf_enabled(self) -> bool:
         return bool(getattr(self.config.runtime, "write_perf_metrics", False))
@@ -269,7 +293,15 @@ class PIIMaskingPipeline:
                 perf_metrics["asr_engine_sec"] = dict(getattr(self.asr, "last_engine_timings_sec", {}) or {})
             self._record_cuda_memory(perf_metrics, "after_asr")
             with self._time_perf_stage(perf_metrics, "pii_detection_and_mapping"):
-                unmapped_fallback_used = self._handle_asr_results(results, transcripts, all_entities, raw_spans, row, duration) or unmapped_fallback_used
+                unmapped_fallback_used = self._handle_asr_results(
+                    results,
+                    transcripts,
+                    all_entities,
+                    raw_spans,
+                    row,
+                    duration,
+                    alignment_audio_by_channel=self._alignment_audio_by_channel(asr_inputs),
+                ) or unmapped_fallback_used
         elif strategy == "ffmpeg_temp_wav":
             with self._time_perf_stage(perf_metrics, "ffmpeg_temp_wav_asr"):
                 used_combined_channel_extract, temp_fallback_used = self._process_with_temp_wavs(
@@ -338,6 +370,11 @@ class PIIMaskingPipeline:
         all_entities: list[dict] = []
         raw_spans: list[dict] = []
         bundles = self._bundles_from_cached_asr_results(asr_results)
+        if not (meta or {}).get("channels"):
+            inferred_channels = self._infer_channel_count_from_asr_results(asr_results)
+            meta = dict(meta or {})
+            meta["channels"] = inferred_channels
+        alignment_audio_by_channel = self._decode_alignment_audio(input_path, meta)
 
         with self._time_perf_stage(perf_metrics, "pii_detection_and_mapping"):
             unmapped_fallback_used = self._handle_asr_bundles(
@@ -347,6 +384,7 @@ class PIIMaskingPipeline:
                 raw_spans,
                 row,
                 duration,
+                alignment_audio_by_channel=alignment_audio_by_channel,
             )
 
         return self._finalize_outputs(
@@ -550,6 +588,7 @@ class PIIMaskingPipeline:
                     "all_entities": [],
                     "raw_spans": [],
                     "unmapped_fallback_used": False,
+                    "alignment_audio_by_channel": self._alignment_audio_by_channel(asr_inputs),
                     "used_single_decode": True,
                     "used_combined_channel_extract": False,
                     "perf_metrics": perf_metrics,
@@ -595,8 +634,12 @@ class PIIMaskingPipeline:
             detection_items: list[dict] = []
             for file_id, ctx in contexts.items():
                 for bundle in bundles_by_file.get(file_id, []):
-                    ctx["transcripts"].append(self._bundle_to_transcript_dict(bundle))
-                    for item in self._detection_items_for_bundle(bundle):
+                    transcript_row, bundle_items = self._prepare_bundle_for_detection(
+                        bundle,
+                        alignment_audio_by_channel=ctx.get("alignment_audio_by_channel"),
+                    )
+                    ctx["transcripts"].append(transcript_row)
+                    for item in bundle_items:
                         item["file_id"] = file_id
                         detection_items.append(item)
 
@@ -624,6 +667,8 @@ class PIIMaskingPipeline:
                             asr_engine=item.get("engine"),
                             existing_count=len(ctx["all_entities"]) + len(enriched),
                         )
+                        ent["timestamp_source"] = item.get("timestamp_source")
+                        ent["alignment_backend"] = item.get("alignment_backend")
                         enriched.append(ent)
                         ctx["all_entities"].append(ent)
                     spans, used = self._map_entities_to_spans_conservative(
@@ -924,17 +969,29 @@ class PIIMaskingPipeline:
                     threads=self.config.runtime.ffmpeg_threads,
                 )
                 if hasattr(self.asr, "transcribe_channels"):
-                    import numpy as np
-                    with __import__("wave").open(str(wav_path), "rb") as wf:
-                        data = wf.readframes(wf.getnframes())
-                    audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                    audio = self._read_wav_float32(wav_path)
                     asr_inputs = [{"channel": -1, "audio": audio, "sample_rate": self.config.asr.channel_wav_sample_rate}]
                     bundles_or_results = self._transcribe_asr_inputs(asr_inputs)
-                    fallback_used = self._handle_asr_results(bundles_or_results, transcripts, all_entities, raw_spans, row, duration)
+                    fallback_used = self._handle_asr_results(
+                        bundles_or_results,
+                        transcripts,
+                        all_entities,
+                        raw_spans,
+                        row,
+                        duration,
+                        alignment_audio_by_channel=self._alignment_audio_by_channel(asr_inputs),
+                    )
                     return used_combined, bool(fallback_used)
+                mono_audio = self._read_wav_float32(wav_path)
+                alignment_audio_by_channel = (
+                    {-1: {"audio": mono_audio, "sample_rate": self.config.asr.channel_wav_sample_rate}}
+                    if self._alignment_enabled()
+                    else {}
+                )
                 results.append(self.asr.transcribe_path(wav_path, channel=-1))
             elif self.config.asr.mode == "per_channel":
                 channel_wavs: dict[int, Path] = {}
+                alignment_audio_by_channel = {}
                 if channel_count == 2:
                     ch0 = temp_dir / "ch0.wav"
                     ch1 = temp_dir / "ch1.wav"
@@ -965,22 +1022,198 @@ class PIIMaskingPipeline:
                         )
                         channel_wavs[channel] = wav_path
                 if hasattr(self.asr, "transcribe_channels"):
-                    import numpy as np
                     asr_inputs = []
                     for channel, wav_path in sorted(channel_wavs.items()):
-                        with __import__("wave").open(str(wav_path), "rb") as wf:
-                            data = wf.readframes(wf.getnframes())
-                        audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                        audio = self._read_wav_float32(wav_path)
                         asr_inputs.append({"channel": int(channel), "audio": audio, "sample_rate": self.config.asr.channel_wav_sample_rate})
                     bundles_or_results = self._transcribe_asr_inputs(asr_inputs)
-                    fallback_used = self._handle_asr_results(bundles_or_results, transcripts, all_entities, raw_spans, row, duration)
+                    fallback_used = self._handle_asr_results(
+                        bundles_or_results,
+                        transcripts,
+                        all_entities,
+                        raw_spans,
+                        row,
+                        duration,
+                        alignment_audio_by_channel=self._alignment_audio_by_channel(asr_inputs),
+                    )
                     return used_combined, bool(fallback_used)
                 for channel, wav_path in sorted(channel_wavs.items()):
+                    if self._alignment_enabled():
+                        alignment_audio_by_channel[int(channel)] = {
+                            "audio": self._read_wav_float32(wav_path),
+                            "sample_rate": self.config.asr.channel_wav_sample_rate,
+                        }
                     results.append(self.asr.transcribe_path(wav_path, channel=channel))
             else:
                 raise ValueError(f"Unsupported ASR mode: {self.config.asr.mode}")
-            fallback_used = self._handle_asr_results(results, transcripts, all_entities, raw_spans, row, duration)
+            fallback_used = self._handle_asr_results(
+                results,
+                transcripts,
+                all_entities,
+                raw_spans,
+                row,
+                duration,
+                alignment_audio_by_channel=alignment_audio_by_channel,
+            )
         return used_combined, bool(fallback_used)
+
+    @staticmethod
+    def _read_wav_float32(wav_path: Path) -> np.ndarray:
+        with wave.open(str(wav_path), "rb") as wf:
+            if wf.getsampwidth() != 2:
+                raise ValueError(f"Alignment WAV must be 16-bit PCM; got sample width {wf.getsampwidth()} bytes")
+            data = wf.readframes(wf.getnframes())
+        return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+
+    @staticmethod
+    def _infer_channel_count_from_asr_results(asr_results: Sequence[ASRResult]) -> int:
+        channels = [int(result.channel) for result in asr_results or [] if int(result.channel) >= 0]
+        if not channels:
+            return 1
+        return min(2, max(1, max(channels) + 1))
+
+    def _alignment_enabled(self) -> bool:
+        return bool(getattr(getattr(self.config, "alignment", None), "enabled", False)) and getattr(self, "forced_aligner", None) is not None
+
+    @staticmethod
+    def _alignment_audio_by_channel(asr_inputs: Sequence[dict]) -> dict[int, dict]:
+        return {
+            int(item["channel"]): {
+                "audio": item["audio"],
+                "sample_rate": int(item.get("sample_rate") or 16000),
+            }
+            for item in asr_inputs or []
+            if "channel" in item and "audio" in item
+        }
+
+    def _decode_alignment_audio(self, input_path: Path, meta: Optional[dict]) -> dict[int, dict]:
+        if not self._alignment_enabled():
+            return {}
+        try:
+            n_input_channels = int((meta or {}).get("channels") or 1)
+            channel_count = min(2, max(1, n_input_channels))
+            audio_48k = decode_to_float32_stereo_48k(
+                input_path,
+                ffmpeg_path=self.config.runtime.ffmpeg_path,
+                threads=self.config.runtime.ffmpeg_threads,
+                sample_rate=self.config.masking.output_sample_rate,
+                channels=self.config.masking.output_channels,
+            )
+            asr_inputs = make_asr_audio_inputs(
+                audio_48k,
+                mode=self.config.asr.mode,
+                input_channels=channel_count,
+                source_sr=self.config.masking.output_sample_rate,
+                target_sr=self.config.asr.channel_wav_sample_rate,
+            )
+            return self._alignment_audio_by_channel(asr_inputs)
+        except Exception as exc:
+            logger.warning(
+                "Could not prepare audio for forced alignment; using configured fallback policy. Error: %s",
+                self._safe_alignment_error(exc),
+            )
+            return {}
+
+    def _align_detection_item(self, item: dict, alignment_audio_by_channel: Optional[dict[int, dict]]) -> dict:
+        if not self._alignment_enabled():
+            metadata = self._alignment_metadata(status="disabled", result=None, error=None)
+            item["alignment"] = metadata
+            item["timestamp_source"] = "asr_words"
+            return metadata
+
+        audio_info = (alignment_audio_by_channel or {}).get(int(item.get("channel", -999)))
+        if not audio_info:
+            return self._apply_alignment_failure(item, status="missing_audio", result=None, error="alignment audio unavailable")
+
+        try:
+            result = self.forced_aligner.align(
+                audio=audio_info["audio"],
+                sample_rate=int(audio_info.get("sample_rate") or self.config.asr.channel_wav_sample_rate),
+                transcript=str(item.get("text") or ""),
+                language=item.get("language"),
+                channel=int(item["channel"]),
+            )
+        except Exception as exc:
+            return self._apply_alignment_failure(item, status="error", result=None, error=self._safe_alignment_error(exc))
+
+        min_ratio = float(getattr(self.config.alignment, "min_aligned_words_ratio", 0.70))
+        if result.words and float(result.coverage) >= min_ratio:
+            item["words"] = result.words
+            item["timestamp_source"] = "forced_alignment"
+            item["alignment_backend"] = result.backend
+            metadata = self._alignment_metadata(status="aligned", result=result, error=None)
+            item["alignment"] = metadata
+            return metadata
+        status = "low_coverage" if float(result.coverage) < min_ratio else str(result.status or "unaligned")
+        return self._apply_alignment_failure(item, status=status, result=result, error=result.error)
+
+    def _apply_alignment_failure(self, item: dict, status: str, result: Optional[AlignmentResult], error: Optional[str]) -> dict:
+        policy = str(getattr(self.config.alignment, "on_failure", "fallback_full_channel"))
+        if policy == "fail":
+            raise RuntimeError(f"Forced alignment failed for channel={item.get('channel')} source={item.get('source')}: {status}")
+        if policy == "use_asr_words":
+            if not item.get("words"):
+                item["timestamp_source"] = "forced_alignment_fallback_full_channel"
+                item["alignment_backend"] = getattr(self.forced_aligner, "backend", "whisperx")
+                metadata = self._alignment_metadata(status=f"{status}_empty_asr_words_fallback_full_channel", result=result, error=error)
+                item["alignment"] = metadata
+                return metadata
+            item["timestamp_source"] = "asr_words"
+            item["alignment_backend"] = getattr(self.forced_aligner, "backend", "whisperx")
+            metadata = self._alignment_metadata(status=f"{status}_used_asr_words", result=result, error=error)
+            item["alignment"] = metadata
+            return metadata
+
+        item["words"] = []
+        item["timestamp_source"] = "forced_alignment_fallback_full_channel"
+        item["alignment_backend"] = getattr(self.forced_aligner, "backend", "whisperx")
+        metadata = self._alignment_metadata(status=f"{status}_fallback_full_channel", result=result, error=error)
+        item["alignment"] = metadata
+        return metadata
+
+    def _alignment_metadata(self, status: str, result: Optional[AlignmentResult], error: Optional[str]) -> dict:
+        backend = getattr(getattr(self, "forced_aligner", None), "backend", getattr(getattr(self.config, "alignment", None), "backend", "whisperx"))
+        return {
+            "alignment_status": status,
+            "alignment_backend": backend,
+            "alignment_coverage": float(result.coverage) if result is not None else None,
+            "alignment_word_count": int(result.aligned_word_count) if result is not None else 0,
+            "alignment_transcript_word_count": int(result.transcript_word_count) if result is not None else None,
+            "alignment_language": result.language if result is not None else None,
+            "alignment_error": error,
+        }
+
+    def _apply_alignment_metadata_to_transcript_row(self, transcript_row: dict, item: dict) -> None:
+        metadata = dict(item.get("alignment") or {})
+        source = str(item.get("source") or "")
+        words = item.get("words") or []
+        metadata["timestamp_source"] = item.get("timestamp_source")
+        if source == "final_consensus":
+            transcript_row.update(metadata)
+            if item.get("timestamp_source") == "forced_alignment":
+                self._replace_transcript_words(transcript_row, words)
+            return
+        if source.startswith("engine:"):
+            engine = source.split(":", 1)[1]
+            for row in transcript_row.get("engine_results", []) or []:
+                if row.get("engine") == engine:
+                    row.update(metadata)
+                    if item.get("timestamp_source") == "forced_alignment":
+                        self._replace_transcript_words(row, words)
+                    return
+            logger.warning("Alignment metadata could not be attached to missing engine transcript row: %s", engine)
+
+    def _replace_transcript_words(self, row: dict, words: list[dict]) -> None:
+        row["word_count"] = len(words)
+        if "words" in row:
+            row["words"] = words
+        row.update(self._confidence_summary(words))
+
+    @staticmethod
+    def _safe_alignment_error(exc: BaseException | str) -> str:
+        if isinstance(exc, BaseException):
+            return type(exc).__name__
+        return str(exc).split(":", 1)[0][:120] or "AlignmentError"
 
     def _handle_asr_results(
         self,
@@ -990,29 +1223,56 @@ class PIIMaskingPipeline:
         raw_spans: list[dict],
         row: Optional[dict],
         duration: Optional[float],
+        alignment_audio_by_channel: Optional[dict[int, dict]] = None,
     ) -> bool:
         if not results:
             return False
         first = results[0]
         if isinstance(first, ChannelASRBundle) or hasattr(first, "engine_results"):
-            return self._handle_asr_bundles(results, transcripts, all_entities, raw_spans, row, duration)  # type: ignore[arg-type]
+            return self._handle_asr_bundles(  # type: ignore[arg-type]
+                results,
+                transcripts,
+                all_entities,
+                raw_spans,
+                row,
+                duration,
+                alignment_audio_by_channel=alignment_audio_by_channel,
+            )
 
         fallback_used = False
-        transcripts.extend(self._asr_result_to_dict(r) for r in results)  # type: ignore[arg-type]
-        detected = self.detector.detect_batch([r.transcript for r in results], rows=[row for _ in results])  # type: ignore[attr-defined]
-        for result, entities in zip(results, detected):  # type: ignore[assignment]
+        items: list[dict] = []
+        for result in results:  # type: ignore[assignment]
+            item = {
+                "channel": int(result.channel),
+                "source": result.engine,
+                "engine": result.engine,
+                "text": result.transcript,
+                "words": result.words,
+                "language": result.language,
+            }
+            self._align_detection_item(item, alignment_audio_by_channel)
+            transcripts.append(self._asr_result_to_dict(result))  # type: ignore[arg-type]
+            transcripts[-1].update(item.get("alignment") or {})
+            transcripts[-1]["timestamp_source"] = item.get("timestamp_source")
+            if "words" in transcripts[-1] and item.get("timestamp_source") == "forced_alignment":
+                transcripts[-1]["words"] = item.get("words") or []
+            items.append(item)
+        detected = self.detector.detect_batch([item["text"] for item in items], rows=[row for _ in items])  # type: ignore[attr-defined]
+        for item, entities in zip(items, detected):
             enriched = []
             for e in entities:
                 ent = self._enrich_entity(
                     e,
-                    channel=result.channel,
-                    transcript_source=result.engine,
-                    asr_engine=result.engine,
+                    channel=int(item["channel"]),
+                    transcript_source=item["source"],
+                    asr_engine=item.get("engine"),
                     existing_count=len(all_entities) + len(enriched),
                 )
+                ent["timestamp_source"] = item.get("timestamp_source")
+                ent["alignment_backend"] = item.get("alignment_backend")
                 enriched.append(ent)
                 all_entities.append(ent)
-            spans, used = self._map_entities_to_spans_conservative(enriched, result.words, result.channel, duration)
+            spans, used = self._map_entities_to_spans_conservative(enriched, item.get("words") or [], int(item["channel"]), duration)
             raw_spans.extend(spans)
             fallback_used = fallback_used or used
         return fallback_used
@@ -1040,13 +1300,18 @@ class PIIMaskingPipeline:
         raw_spans: list[dict],
         row: Optional[dict],
         duration: Optional[float],
+        alignment_audio_by_channel: Optional[dict[int, dict]] = None,
     ) -> bool:
         fallback_used = False
         detection_items: list[dict] = []
 
         for bundle in bundles:
-            transcripts.append(self._bundle_to_transcript_dict(bundle))
-            detection_items.extend(self._detection_items_for_bundle(bundle))
+            transcript_row, bundle_items = self._prepare_bundle_for_detection(
+                bundle,
+                alignment_audio_by_channel=alignment_audio_by_channel,
+            )
+            transcripts.append(transcript_row)
+            detection_items.extend(bundle_items)
 
         texts = [d["text"] for d in detection_items]
         if not texts:
@@ -1062,6 +1327,8 @@ class PIIMaskingPipeline:
                     asr_engine=item.get("engine"),
                     existing_count=len(all_entities) + len(enriched),
                 )
+                ent["timestamp_source"] = item.get("timestamp_source")
+                ent["alignment_backend"] = item.get("alignment_backend")
                 enriched.append(ent)
                 all_entities.append(ent)
             spans, used = self._map_entities_to_spans_conservative(enriched, item.get("words") or [], int(item["channel"]), duration)
@@ -1069,12 +1336,25 @@ class PIIMaskingPipeline:
             fallback_used = fallback_used or used
         return fallback_used
 
+    def _prepare_bundle_for_detection(
+        self,
+        bundle: ChannelASRBundle,
+        alignment_audio_by_channel: Optional[dict[int, dict]] = None,
+    ) -> tuple[dict, list[dict]]:
+        transcript_row = self._bundle_to_transcript_dict(bundle)
+        items = self._detection_items_for_bundle(bundle)
+        for item in items:
+            self._align_detection_item(item, alignment_audio_by_channel)
+            self._apply_alignment_metadata_to_transcript_row(transcript_row, item)
+        return transcript_row, items
+
     def _detection_items_for_bundle(self, bundle: ChannelASRBundle) -> list[dict]:
         scope = str(getattr(self.config.asr, "pii_detection_transcript_scope", "final_and_all_engines"))
         items: list[dict] = []
         seen: set[tuple[str, str]] = set()
+        languages_by_engine = {r.engine: r.language for r in bundle.engine_results if r.language}
 
-        def add(source: str, engine: Optional[str], text: str, words: list[dict]):
+        def add(source: str, engine: Optional[str], text: str, words: list[dict], language: Optional[str]):
             text = str(text or "").strip()
             if not text:
                 return
@@ -1082,10 +1362,18 @@ class PIIMaskingPipeline:
             if key in seen:
                 return
             seen.add(key)
-            items.append({"channel": bundle.channel, "source": source, "engine": engine, "text": text, "words": words})
+            items.append({
+                "channel": bundle.channel,
+                "source": source,
+                "engine": engine,
+                "text": text,
+                "words": words,
+                "language": language,
+            })
 
         if scope in {"final_only", "final_and_all_engines"}:
-            add("final_consensus", bundle.consensus.get("selected_engine"), bundle.final_transcript, bundle.final_words)
+            selected_engine = bundle.consensus.get("selected_engine")
+            add("final_consensus", selected_engine, bundle.final_transcript, bundle.final_words, languages_by_engine.get(selected_engine))
 
         if scope in {"all_engines_only", "final_and_all_engines"}:
             for result in bundle.engine_results:
@@ -1097,7 +1385,7 @@ class PIIMaskingPipeline:
                     words = bundle.anchor_words
                 else:
                     words = align_transcript_to_timed_words(result.transcript, bundle.anchor_words, channel=bundle.channel)
-                add(f"engine:{result.engine}", result.engine, result.transcript, words)
+                add(f"engine:{result.engine}", result.engine, result.transcript, words, result.language)
         return items
 
     def _map_entities_to_spans_conservative(
@@ -1173,6 +1461,8 @@ class PIIMaskingPipeline:
             channel_entities = [e for e in all_entities if int(e.get("channel", -1)) == ch]
             texts = [str(e.get("text", "")) for e in channel_entities]
             entity_ids = sorted({str(e.get("entity_id")) for e in channel_entities if e.get("entity_id")})
+            timestamp_sources = sorted({str(e.get("timestamp_source")) for e in channel_entities if e.get("timestamp_source")})
+            alignment_backends = sorted({str(e.get("alignment_backend")) for e in channel_entities if e.get("alignment_backend")})
             spans.append({
                 "channel": ch,
                 "start": 0.0,
@@ -1184,6 +1474,8 @@ class PIIMaskingPipeline:
                 "score": 1.0,
                 "entity_ids": entity_ids,
                 "entity_id": entity_ids[0] if len(entity_ids) == 1 else None,
+                "timestamp_source": timestamp_sources[0] if len(timestamp_sources) == 1 else ("mixed_fallback" if timestamp_sources else "unmapped_entity_policy"),
+                "alignment_backend": alignment_backends[0] if len(alignment_backends) == 1 else None,
             })
         return spans, True
 
@@ -1309,7 +1601,7 @@ class PIIMaskingPipeline:
         items: list[dict] = []
         seen: set[tuple[int, str, Optional[str], int]] = set()
 
-        def add(channel: int, source: str, engine: Optional[str], text: str, word_count: int) -> None:
+        def add(channel: int, source: str, engine: Optional[str], text: str, word_count: int, alignment: Optional[dict] = None) -> None:
             text = str(text or "").strip()
             if not text:
                 return
@@ -1324,6 +1616,7 @@ class PIIMaskingPipeline:
                 "asr_engine": engine,
                 "text_char_count": len(text),
                 "word_count": int(word_count),
+                **(alignment or {}),
             })
 
         for row in transcripts or []:
@@ -1337,17 +1630,30 @@ class PIIMaskingPipeline:
                         consensus.get("selected_engine"),
                         str(row.get("final_transcript") or row.get("transcript") or ""),
                         int(row.get("word_count") or 0),
+                        self._transcript_alignment_summary(row),
                     )
                 if scope in {"all_engines_only", "final_and_all_engines"}:
                     engine_transcripts = row.get("engine_transcripts") or {}
                     engine_results = {r.get("engine"): r for r in row.get("engine_results", []) if isinstance(r, dict)}
                     for engine, text in engine_transcripts.items():
                         result = engine_results.get(engine) or {}
-                        add(channel, f"engine:{engine}", engine, str(text or ""), int(result.get("word_count") or 0))
+                        add(channel, f"engine:{engine}", engine, str(text or ""), int(result.get("word_count") or 0), self._transcript_alignment_summary(result))
             else:
                 engine = row.get("engine")
-                add(channel, str(engine or "unknown"), engine, str(row.get("transcript") or ""), int(row.get("word_count") or 0))
+                add(channel, str(engine or "unknown"), engine, str(row.get("transcript") or ""), int(row.get("word_count") or 0), self._transcript_alignment_summary(row))
         return items
+
+    @staticmethod
+    def _transcript_alignment_summary(row: dict) -> dict:
+        keys = [
+            "alignment_status",
+            "alignment_backend",
+            "alignment_coverage",
+            "alignment_word_count",
+            "alignment_transcript_word_count",
+            "timestamp_source",
+        ]
+        return {key: row.get(key) for key in keys if key in row}
 
     @staticmethod
     def _span_entity_ids(span: dict) -> set[str]:
@@ -1390,6 +1696,73 @@ class PIIMaskingPipeline:
             "unmapped_fallback_used": bool(unmapped_fallback_used),
         }
 
+    def _alignment_audit(self, transcripts: list[dict], raw_spans: list[dict]) -> dict:
+        align_cfg = getattr(self.config, "alignment", None)
+        enabled = bool(getattr(align_cfg, "enabled", False))
+        rows: list[dict] = []
+        for row in transcripts or []:
+            if "alignment_status" in row:
+                rows.append(row)
+            for engine_row in row.get("engine_results", []) or []:
+                if isinstance(engine_row, dict) and "alignment_status" in engine_row:
+                    rows.append(engine_row)
+
+        statuses = sorted({str(row.get("alignment_status")) for row in rows if row.get("alignment_status")})
+        fallback_span_count = sum(
+            1
+            for span in raw_spans or []
+            if str(span.get("type")) in {"UNMAPPED_PII_FALLBACK", "EMPTY_TRANSCRIPT_FAILSAFE"}
+            or str(span.get("source")) in {"unmapped_entity_policy", "empty_transcript_failsafe"}
+        )
+        forced_span_count = sum(1 for span in raw_spans or [] if str(span.get("timestamp_source")) == "forced_alignment")
+        asr_words_span_count = sum(1 for span in raw_spans or [] if str(span.get("timestamp_source")) == "asr_words")
+        alignment_fallback_span_count = sum(
+            1
+            for span in raw_spans or []
+            if str(span.get("timestamp_source")) == "forced_alignment_fallback_full_channel"
+        )
+        if not enabled:
+            status = "disabled"
+        elif not rows:
+            status = "fallback_used" if fallback_span_count else "not_run"
+        elif statuses and all(value == "disabled" for value in statuses):
+            status = "disabled"
+        elif any("fallback_full_channel" in value for value in statuses) or fallback_span_count:
+            status = "fallback_used"
+        elif statuses == ["aligned"]:
+            status = "aligned"
+        elif any("error" in value or "low_coverage" in value or "unaligned" in value or "missing_audio" in value for value in statuses):
+            status = "degraded"
+        else:
+            status = "mixed"
+
+        coverage_values = []
+        for row in rows:
+            value = row.get("alignment_coverage")
+            if value is None:
+                continue
+            try:
+                coverage_values.append(float(value))
+            except (TypeError, ValueError):
+                continue
+
+        return {
+            "enabled": enabled,
+            "backend": getattr(align_cfg, "backend", "whisperx"),
+            "status": status,
+            "statuses": statuses,
+            "on_failure": getattr(align_cfg, "on_failure", "fallback_full_channel"),
+            "min_aligned_words_ratio": getattr(align_cfg, "min_aligned_words_ratio", 0.70),
+            "transcript_count": len(rows),
+            "aligned_transcript_count": sum(1 for row in rows if row.get("alignment_status") == "aligned"),
+            "forced_alignment_span_count": forced_span_count,
+            "full_channel_fallback_span_count": fallback_span_count,
+            "alignment_full_channel_fallback_span_count": alignment_fallback_span_count,
+            "asr_words_span_count": asr_words_span_count,
+            "avg_alignment_coverage": float(sum(coverage_values) / len(coverage_values)) if coverage_values else None,
+            "timestamp_sources_in_spans": sorted({str(span.get("timestamp_source")) for span in raw_spans or [] if span.get("timestamp_source")}),
+        }
+
     def _build_sidecar(
         self,
         input_path: Path,
@@ -1422,8 +1795,10 @@ class PIIMaskingPipeline:
             "asr_model_residency": self.config.asr.model_residency,
             "mask_mode": self.config.masking.mode,
             "target_channels": self.config.masking.target_channels,
+            "alignment": self._alignment_audit(transcripts, raw_spans),
             "optimizations": {
-                "no_forced_alignment": True,
+                "forced_alignment": bool(getattr(getattr(self.config, "alignment", None), "enabled", False)),
+                "no_forced_alignment": not bool(getattr(getattr(self.config, "alignment", None), "enabled", False)),
                 "multi_asr_consensus": True,
                 "detect_pii_on_final_and_engine_transcripts": self.config.asr.pii_detection_transcript_scope == "final_and_all_engines",
                 "word_timestamp_anchor": self.config.asr.timestamp_anchor_engine,

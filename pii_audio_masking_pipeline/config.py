@@ -8,6 +8,8 @@ import yaml
 
 VALID_PERFORMANCE_PROFILES = {"default", "a10g_24gb"}
 VALID_PIPELINE_SCHEDULES = {"file_major", "model_major"}
+VALID_ALIGNMENT_BACKENDS = {"whisperx"}
+VALID_ALIGNMENT_FAILURE_POLICIES = {"fallback_full_channel", "use_asr_words", "fail"}
 
 
 @dataclass
@@ -216,6 +218,18 @@ class MaskingConfig:
 
 
 @dataclass
+class AlignmentConfig:
+    enabled: bool = True
+    backend: str = "whisperx"
+    device: str = "auto"  # auto, cuda, cpu
+    compute_type: str = "float16"
+    batch_size: int = 16
+    on_failure: str = "fallback_full_channel"  # fallback_full_channel, use_asr_words, fail
+    min_aligned_words_ratio: float = 0.70
+    default_language: str = "en"
+
+
+@dataclass
 class RuntimeConfig:
     resume: bool = True
     limit: Optional[int] = None
@@ -258,6 +272,7 @@ class RuntimeConfig:
 class PipelineConfig:
     paths: PathConfig = field(default_factory=PathConfig)
     asr: ASRConfig = field(default_factory=ASRConfig)
+    alignment: AlignmentConfig = field(default_factory=AlignmentConfig)
     pii: PIIConfig = field(default_factory=PIIConfig)
     masking: MaskingConfig = field(default_factory=MaskingConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -301,6 +316,7 @@ def load_config(path: Optional[str | Path] = None, apply_profile: bool = True) -
     config = PipelineConfig(
         paths=_make_dataclass(PathConfig, merged.get("paths", {})),
         asr=_make_dataclass(ASRConfig, merged.get("asr", {})),
+        alignment=_make_dataclass(AlignmentConfig, merged.get("alignment", {})),
         pii=_make_dataclass(PIIConfig, merged.get("pii", {})),
         masking=_make_dataclass(MaskingConfig, merged.get("masking", {})),
         runtime=_make_dataclass(RuntimeConfig, merged.get("runtime", {})),
@@ -351,6 +367,16 @@ def validate_config(config: PipelineConfig) -> PipelineConfig:
         raise ValueError("runtime.performance_profile must be default or a10g_24gb")
     if config.runtime.pipeline_schedule not in VALID_PIPELINE_SCHEDULES:
         raise ValueError("runtime.pipeline_schedule must be file_major or model_major")
+    if config.alignment.backend not in VALID_ALIGNMENT_BACKENDS:
+        raise ValueError("alignment.backend must be whisperx")
+    if config.alignment.device not in {"auto", "cuda", "cpu"}:
+        raise ValueError("alignment.device must be auto, cuda, or cpu")
+    if config.alignment.on_failure not in VALID_ALIGNMENT_FAILURE_POLICIES:
+        raise ValueError("alignment.on_failure must be fallback_full_channel, use_asr_words, or fail")
+    if int(config.alignment.batch_size) < 1:
+        raise ValueError("alignment.batch_size must be >= 1")
+    if not (0.0 <= float(config.alignment.min_aligned_words_ratio) <= 1.0):
+        raise ValueError("alignment.min_aligned_words_ratio must be between 0 and 1")
     if config.asr.mode not in {"per_channel", "mono_mix"}:
         raise ValueError("asr.mode must be 'per_channel' or 'mono_mix'")
     if config.asr.input_audio_strategy not in {"single_decode", "ffmpeg_temp_wav"}:

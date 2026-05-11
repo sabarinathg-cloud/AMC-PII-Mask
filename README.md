@@ -11,7 +11,7 @@ channels: 2
 container: .opus
 ```
 
-The pipeline transcribes each call, detects PII in the transcript text, maps detected entities to word timestamps, masks only the required audio spans, and writes the masked audio back in the same required format.
+The pipeline transcribes each call, forced-aligns the selected transcripts with WhisperX, detects PII in the transcript text, maps detected entities to aligned word timestamps, masks only the required audio spans, and writes the masked audio back in the same required format.
 
 ## What is optimized now
 
@@ -24,6 +24,7 @@ This version uses batching at every practical layer:
 | Qwen | file-channel WAVs across the micro-batch | `asr.engines.qwen.batch_size` |
 | Cohere | file-channel WAVs across the micro-batch | `asr.engines.cohere.batch_size` |
 | Granite | file-channel WAVs across the micro-batch | `asr.engines.granite.batch_size` |
+| Forced alignment | final and per-engine transcripts before PII span mapping | `alignment.enabled`, `alignment.backend` |
 | PII detection | all final and per-engine transcripts across the micro-batch | `pii.batch_size` |
 | Corpus scale-out | one process per shard or GPU | `runtime.shard_count`, `runtime.shard_index` |
 
@@ -54,8 +55,8 @@ flowchart TD
     F4 --> G
 
     G --> H[Final transcript per channel]
-    F1 --> I[Word timestamp anchor]
-    H --> J[Align consensus and non-Whisper transcripts to anchor timeline]
+    F1 --> I[Initial word timestamp anchor]
+    H --> J[WhisperX forced alignment for final and engine transcripts]
     I --> J
 
     J --> K[Batch PII detection across all texts]
@@ -139,11 +140,24 @@ cp config.example.yaml config.yaml
 Optional dependencies depend on your local model setup:
 
 ```text
+whisperx for forced alignment
 qwen_asr package exposing Qwen3ASRModel
 local Cohere speech model code if required by your model folder
 local Granite speech model code if required by your model folder
 spacy + en_core_web_sm only when pii.enable_spacy=true
 ```
+
+Install WhisperX on the server before using the default alignment config:
+
+```bash
+python3 -m pip install whisperx
+python3 - <<'PY'
+import whisperx
+print("whisperx import ok", getattr(whisperx, "__version__", "unknown"))
+PY
+```
+
+Because `alignment.enabled` is `true` by default, startup fails with a clear install message if `whisperx` is not importable. Set `alignment.enabled: false` only for a temporary ASR-timestamp fallback run.
 
 ## Run
 
@@ -223,6 +237,15 @@ pii:
   enable_gliner: true
   enable_piiranha: true
 
+alignment:
+  enabled: true
+  backend: whisperx
+  device: auto
+  compute_type: float16
+  batch_size: 16
+  on_failure: fallback_full_channel
+  min_aligned_words_ratio: 0.70
+
 masking:
   mode: silence
   copy_input_if_no_pii: true
@@ -298,7 +321,7 @@ Every output gets:
 <masked_audio>.pii_masking.json
 ```
 
-The sidecar includes input metadata, consensus transcripts, per-engine transcripts, PII entities, raw spans, merged spans, validation, and optimization flags. Transcript rows include word-level confidence when the ASR engine provides it, plus a `transcript_confidence` summary computed from word probabilities. PII audit fields show which detector found each entity (`source`), which ASR transcript it came from (`asr_engine` / `transcript_source`), and whether every detected entity was covered by timestamp masking or full-channel fallback.
+The sidecar includes input metadata, consensus transcripts, per-engine transcripts, PII entities, raw spans, merged spans, validation, forced-alignment audit, and optimization flags. Transcript rows include word-level confidence when the ASR/alignment backend provides it, plus a `transcript_confidence` summary computed from word probabilities. Alignment fields show `alignment_status`, `alignment_backend`, `alignment_coverage`, and whether spans came from `forced_alignment` or full-channel fallback. PII audit fields show which detector found each entity (`source`), which ASR transcript it came from (`asr_engine` / `transcript_source`), and whether every detected entity was covered by timestamp masking or full-channel fallback.
 
 Word details are enabled by default for auditability:
 
