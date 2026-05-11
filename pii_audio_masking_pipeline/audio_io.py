@@ -20,6 +20,19 @@ class AudioCommandError(RuntimeError):
     pass
 
 
+def _normalize_opus_vbr(value: str | bool) -> str:
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "yes", "1"}:
+        return "on"
+    if normalized in {"false", "no", "0"}:
+        return "off"
+    if normalized in {"on", "off", "constrained"}:
+        return normalized
+    raise ValueError("Opus vbr must be one of: on, off, constrained")
+
+
 def run_cmd(cmd: list[str], input_bytes: bytes | None = None, timeout: int | None = None) -> subprocess.CompletedProcess:
     proc = subprocess.run(cmd, input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     if proc.returncode != 0:
@@ -296,6 +309,7 @@ def encode_float32_stereo_to_opus(
             raise ValueError(f"Expected {channels} channels, got shape={x.shape}")
     x = np.clip(x, -1.0, 1.0)
     x = np.ascontiguousarray(x, dtype=np.float32)
+    vbr = _normalize_opus_vbr(vbr)
 
     final_path = output_path
     tmp_path: Path | None = None
@@ -326,7 +340,7 @@ def encode_float32_stereo_to_opus(
             "-c:a", "libopus",
             "-application", application,
             "-b:a", str(bitrate),
-            "-vbr", str(vbr),
+            "-vbr", vbr,
         ]
         if compression_level is not None:
             cmd += ["-compression_level", str(int(compression_level))]

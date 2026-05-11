@@ -168,7 +168,8 @@ masking:
   # so encodes from low-bitrate VoIP sources stay valid.
   opus_min_bitrate_kbps: 24
   opus_application: voip
-  opus_vbr: on
+  # Quote "on" so YAML loaders do not parse it as a boolean True.
+  opus_vbr: "on"
   opus_compression_level: 5
   opus_frame_duration_ms: 20
 

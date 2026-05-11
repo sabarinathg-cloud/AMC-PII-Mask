@@ -316,3 +316,37 @@ def test_encode_float32_stereo_to_opus_cleans_up_pcm_tempfile_on_success(monkeyp
     assert out.exists()
     for p in written_paths:
         assert not p.exists(), f"temp PCM file {p} should be cleaned up"
+
+
+def test_encode_float32_stereo_to_opus_normalizes_yaml_boolean_vbr(monkeypatch, tmp_path: Path):
+    seen_cmds: list[list[str]] = []
+
+    class FakeProc:
+        def __init__(self, cmd, **kwargs):
+            seen_cmds.append(cmd)
+            self.args = cmd
+            self.returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            Path(str(self.args[-1])).write_bytes(b"FAKEOPUS")
+            return (b"", b"")
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(audio_io_module.subprocess, "Popen", FakeProc)
+
+    encode_float32_stereo_to_opus(
+        np.zeros((4800, 2), dtype=np.float32),
+        tmp_path / "out.opus",
+        ffmpeg_path="ffmpeg",
+        vbr=True,
+        atomic=False,
+    )
+
+    cmd = seen_cmds[0]
+    vbr_index = cmd.index("-vbr")
+    assert cmd[vbr_index + 1] == "on"
