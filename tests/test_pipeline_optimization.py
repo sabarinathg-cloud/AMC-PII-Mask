@@ -2,9 +2,12 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
+import pii_audio_masking_pipeline.audio_io as audio_io_module
 import pii_audio_masking_pipeline.pipeline as pipeline_module
 from pii_audio_masking_pipeline.asr import ASRResult, ChannelASRBundle, build_consensus
+from pii_audio_masking_pipeline.audio_io import AudioCommandError, encode_float32_stereo_to_opus
 from pii_audio_masking_pipeline.config import load_config
 from pii_audio_masking_pipeline.pipeline import PIIMaskingPipeline
 
@@ -184,3 +187,132 @@ def test_batch_metrics_are_kept_separate_from_per_file_stage_timings(tmp_path: P
     assert per_file["asr_engine_sec"]["whisper"] == 2.0
     assert per_file["batch_size"] == 4
     assert "do not sum" in per_file["batch_metrics_semantics"]
+
+
+def test_encode_applies_minimum_bitrate_floor(monkeypatch, tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    pipe.config.masking.preserve_input_bitrate = True
+    pipe.config.masking.opus_min_bitrate_kbps = 24
+
+    captured = {}
+
+    def fake_encode(*args, **kwargs):
+        captured["bitrate"] = kwargs.get("bitrate")
+        return Path(args[1] if len(args) > 1 else kwargs["output_path"])
+
+    monkeypatch.setattr(pipeline_module, "encode_float32_stereo_to_opus", fake_encode)
+
+    audio = np.zeros((48000, 2), dtype=np.float32)
+    out = tmp_path / "out.opus"
+
+    pipe._encode(audio, out, {"bit_rate": "15000"})
+    assert captured["bitrate"] == "24k"
+
+    pipe._encode(audio, out, {"bit_rate": "96000"})
+    assert captured["bitrate"] == "96k"
+
+
+def test_encode_floor_applies_when_no_bitrate_metadata(monkeypatch, tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    pipe.config.masking.preserve_input_bitrate = True
+    pipe.config.masking.opus_min_bitrate_kbps = 32
+    pipe.config.masking.opus_bitrate = "16k"
+
+    captured = {}
+
+    def fake_encode(*args, **kwargs):
+        captured["bitrate"] = kwargs.get("bitrate")
+        return Path(kwargs["output_path"]) if "output_path" in kwargs else Path(args[1])
+
+    monkeypatch.setattr(pipeline_module, "encode_float32_stereo_to_opus", fake_encode)
+
+    pipe._encode(np.zeros((4800, 2), dtype=np.float32), tmp_path / "out.opus", {})
+    assert captured["bitrate"] == "32k"
+
+
+def test_encode_float32_stereo_to_opus_writes_pcm_to_tempfile_and_surfaces_stderr(monkeypatch, tmp_path: Path):
+    """When ffmpeg fails the user must see the real stderr, not BrokenPipeError."""
+
+    seen_cmds: list[list[str]] = []
+
+    class FakeProc:
+        def __init__(self, cmd, **kwargs):
+            seen_cmds.append(cmd)
+            self.args = cmd
+            self.returncode = 1
+            self._stderr = (
+                b"[libopus @ 0xdeadbeef] Error: bitrate 16000 not supported "
+                b"for stereo voip application\n"
+            )
+
+        def communicate(self, input=None, timeout=None):
+            return (b"", self._stderr)
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(audio_io_module.subprocess, "Popen", FakeProc)
+
+    audio = np.zeros((4800, 2), dtype=np.float32)
+    with pytest.raises(AudioCommandError) as excinfo:
+        encode_float32_stereo_to_opus(
+            audio,
+            tmp_path / "out.opus",
+            ffmpeg_path="ffmpeg",
+            bitrate="16k",
+            atomic=False,
+        )
+
+    msg = str(excinfo.value)
+    assert "bitrate 16000 not supported" in msg
+    assert seen_cmds, "ffmpeg should have been invoked"
+    cmd = seen_cmds[0]
+    assert "pipe:0" not in cmd, "encoder must read PCM from a temp file, not stdin"
+    pcm_inputs = [c for c in cmd if str(c).endswith(".f32le")]
+    assert pcm_inputs, "encoder must pass a temp .f32le PCM file as input"
+
+
+def test_encode_float32_stereo_to_opus_cleans_up_pcm_tempfile_on_success(monkeypatch, tmp_path: Path):
+    written_paths: list[Path] = []
+
+    class FakeProc:
+        def __init__(self, cmd, **kwargs):
+            self.args = cmd
+            self.returncode = 0
+            for token in cmd:
+                p = Path(str(token))
+                if p.suffix == ".f32le":
+                    written_paths.append(p)
+
+        def communicate(self, input=None, timeout=None):
+            output_path = Path(str(self.args[-1]))
+            output_path.write_bytes(b"FAKEOPUS")
+            return (b"", b"")
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(audio_io_module.subprocess, "Popen", FakeProc)
+
+    out = tmp_path / "ok.opus"
+    encode_float32_stereo_to_opus(
+        np.zeros((4800, 2), dtype=np.float32),
+        out,
+        ffmpeg_path="ffmpeg",
+        atomic=False,
+    )
+    assert out.exists()
+    for p in written_paths:
+        assert not p.exists(), f"temp PCM file {p} should be cleaned up"

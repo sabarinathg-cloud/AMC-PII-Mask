@@ -162,6 +162,11 @@ masking:
   output_channels: 2
   opus_bitrate: 64k
   preserve_input_bitrate: true
+  # libopus stereo refuses very low bitrates (e.g. 16 kb/s) and FFmpeg's encoder
+  # closes the input pipe before consuming any audio, surfacing as BrokenPipeError.
+  # We floor the resolved bitrate (whether from preserve_input_bitrate or opus_bitrate)
+  # so encodes from low-bitrate VoIP sources stay valid.
+  opus_min_bitrate_kbps: 24
   opus_application: voip
   opus_vbr: on
   opus_compression_level: 5

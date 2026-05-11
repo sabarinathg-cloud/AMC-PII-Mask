@@ -1144,12 +1144,40 @@ class PIIMaskingPipeline:
             })
         return spans, True
 
+    @staticmethod
+    def _opus_bitrate_to_kbps(value) -> int:
+        try:
+            s = str(value).strip().lower()
+        except Exception:
+            return 64
+        if not s:
+            return 64
+        if s.endswith("k"):
+            try:
+                return max(1, int(round(float(s[:-1]))))
+            except ValueError:
+                return 64
+        try:
+            n = float(s)
+        except ValueError:
+            return 64
+        if n >= 1000:
+            return max(1, int(round(n / 1000)))
+        return max(1, int(round(n)))
+
     def _encode(self, audio, output_path: Path, input_meta: dict) -> None:
-        bitrate = self.config.masking.opus_bitrate
+        floor_kbps = max(8, int(getattr(self.config.masking, "opus_min_bitrate_kbps", 24)))
+        configured_kbps = self._opus_bitrate_to_kbps(self.config.masking.opus_bitrate)
+        bitrate_kbps = configured_kbps
         if self.config.masking.preserve_input_bitrate and input_meta.get("bit_rate"):
-            br = int(input_meta["bit_rate"])
+            try:
+                br = int(input_meta["bit_rate"])
+            except (TypeError, ValueError):
+                br = 0
             if br > 0:
-                bitrate = f"{max(16, round(br / 1000))}k"
+                bitrate_kbps = round(br / 1000)
+        bitrate_kbps = max(floor_kbps, bitrate_kbps)
+        bitrate = f"{bitrate_kbps}k"
         encode_float32_stereo_to_opus(
             audio,
             output_path,

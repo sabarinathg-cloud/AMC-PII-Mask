@@ -306,56 +306,67 @@ def encode_float32_stereo_to_opus(
         tmp_path = Path(name)
         encode_path = tmp_path
 
-    cmd = [
-        ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error", "-threads", str(threads),
-        "-f", "f32le",
-        "-ar", str(sample_rate),
-        "-ac", str(channels),
-        "-i", "pipe:0",
-        "-vn",
-        "-c:a", "libopus",
-        "-application", application,
-        "-b:a", str(bitrate),
-        "-vbr", str(vbr),
-    ]
-    if compression_level is not None:
-        cmd += ["-compression_level", str(int(compression_level))]
-    if frame_duration_ms is not None:
-        cmd += ["-frame_duration", str(int(frame_duration_ms))]
-    cmd.append(str(encode_path))
-
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert proc.stdin is not None
-    data = memoryview(x).cast("B")
-    chunk = 16 * 1024 * 1024
-    stderr = b""
+    pcm_fd, pcm_name = tempfile.mkstemp(
+        prefix=output_path.name + ".",
+        suffix=".tmp.f32le",
+        dir=str(output_path.parent),
+    )
+    pcm_path = Path(pcm_name)
     try:
-        for offset in range(0, len(data), chunk):
-            proc.stdin.write(data[offset : offset + chunk])
-        proc.stdin.close()
-        stderr = proc.stderr.read() if proc.stderr is not None else b""
-        if proc.stdout is not None:
-            proc.stdout.read()
-        code = proc.wait()
-    except Exception:
-        if proc.poll() is None:
-            proc.kill()
-        if tmp_path and tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-        raise
+        with os.fdopen(pcm_fd, "wb") as pcm_file:
+            pcm_file.write(memoryview(x).cast("B"))
 
-    if code != 0:
-        if tmp_path and tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-        raise AudioCommandError(
-            "Opus encode failed:\n"
-            + " ".join(str(c) for c in cmd)
-            + "\nSTDERR:\n"
-            + stderr.decode("utf-8", errors="replace")[-4000:]
+        cmd = [
+            ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error", "-threads", str(threads),
+            "-f", "f32le",
+            "-ar", str(sample_rate),
+            "-ac", str(channels),
+            "-i", str(pcm_path),
+            "-vn",
+            "-c:a", "libopus",
+            "-application", application,
+            "-b:a", str(bitrate),
+            "-vbr", str(vbr),
+        ]
+        if compression_level is not None:
+            cmd += ["-compression_level", str(int(compression_level))]
+        if frame_duration_ms is not None:
+            cmd += ["-frame_duration", str(int(frame_duration_ms))]
+        cmd.append(str(encode_path))
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-    if tmp_path is not None:
-        os.replace(tmp_path, final_path)
-    return final_path
+        try:
+            _stdout, stderr = proc.communicate()
+        except Exception:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+            raise
+
+        code = proc.returncode
+        if code != 0:
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            stderr_text = (stderr or b"").decode("utf-8", errors="replace")[-4000:]
+            raise AudioCommandError(
+                "Opus encode failed (rc={code}):\n".format(code=code)
+                + " ".join(str(c) for c in cmd)
+                + "\nSTDERR:\n"
+                + (stderr_text or "<empty>")
+            )
+        if tmp_path is not None:
+            os.replace(tmp_path, final_path)
+        return final_path
+    finally:
+        try:
+            pcm_path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("Could not remove PCM temp file %s", pcm_path)
 
 
 def _fade_envelope(n: int, fade_samples: int) -> np.ndarray:
