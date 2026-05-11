@@ -8,7 +8,7 @@ import logging
 import tempfile
 import time
 
-from .asr import ASRResult, ChannelASRBundle, MultiASRTranscriber, align_transcript_to_timed_words
+from .asr import ASRResult, ChannelASRBundle, MultiASRTranscriber, align_transcript_to_timed_words, bundle_asr_results_by_file
 from .audio_io import (
     apply_mask_spans,
     copy_audio_passthrough,
@@ -297,6 +297,104 @@ class PIIMaskingPipeline:
             perf_metrics=perf_metrics,
         )
 
+    def process_file_from_asr_results(
+        self,
+        input_path: str | Path,
+        asr_results: Sequence[ASRResult],
+        row: Optional[dict] = None,
+        meta: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        input_path = Path(input_path)
+        started = time.time()
+        perf_metrics = self._new_perf_metrics()
+        output_path = self.output_path_for(input_path)
+        sidecar_path = self.sidecar_path_for(output_path)
+
+        if meta is None:
+            with self._time_perf_stage(perf_metrics, "ffprobe"):
+                meta = ffprobe_audio(input_path, ffprobe_path=self.config.runtime.ffprobe_path)
+
+        if self._should_skip_existing(input_path, output_path, sidecar_path, meta):
+            return {
+                "input_path": str(input_path),
+                "output_path": str(output_path),
+                "status": "skipped_existing",
+                "sidecar_path": str(sidecar_path),
+                "valid": True,
+            }
+
+        duration = meta.get("duration_sec")
+        if self.config.asr.max_audio_seconds is not None and duration is not None:
+            if float(duration) > float(self.config.asr.max_audio_seconds):
+                raise ValueError(f"Audio duration {duration:.2f}s exceeds max_audio_seconds={self.config.asr.max_audio_seconds}")
+
+        transcripts: list[dict] = []
+        all_entities: list[dict] = []
+        raw_spans: list[dict] = []
+        bundles = self._bundles_from_cached_asr_results(asr_results)
+
+        with self._time_perf_stage(perf_metrics, "pii_detection_and_mapping"):
+            unmapped_fallback_used = self._handle_asr_bundles(
+                bundles,
+                transcripts,
+                all_entities,
+                raw_spans,
+                row,
+                duration,
+            )
+
+        return self._finalize_outputs(
+            input_path=input_path,
+            output_path=output_path,
+            sidecar_path=sidecar_path,
+            started=started,
+            meta=meta,
+            duration=duration,
+            audio_48k=None,
+            transcripts=transcripts,
+            all_entities=all_entities,
+            raw_spans=raw_spans,
+            used_single_decode=False,
+            used_combined_channel_extract=False,
+            unmapped_fallback_used=bool(unmapped_fallback_used),
+            batch_optimized=False,
+            model_major_optimized=True,
+            perf_metrics=perf_metrics,
+        )
+
+    def _bundles_from_cached_asr_results(self, asr_results: Sequence[ASRResult]) -> list[ChannelASRBundle]:
+        if not asr_results:
+            return []
+        anchor_name = str(getattr(self.config.asr, "timestamp_anchor_engine", "whisper"))
+        by_channel: dict[int, list[ASRResult]] = {}
+        for result in asr_results:
+            by_channel.setdefault(int(result.channel), []).append(result)
+
+        for channel, rows in by_channel.items():
+            anchor = next((r for r in rows if r.engine == anchor_name and r.words and not r.error), None)
+            if anchor is None:
+                logger.warning(
+                    "Missing timestamp anchor words for cached ASR channel=%s. "
+                    "Model-major finalization will use full-audio masking failsafe.",
+                    channel,
+                )
+                return []
+
+        asr_inputs = [
+            {"file_id": str(result.file_id or self._cached_file_id(asr_results)), "channel": int(channel)}
+            for channel, rows in sorted(by_channel.items())
+            for result in rows[:1]
+        ]
+        grouped = bundle_asr_results_by_file(asr_results, asr_inputs, self.config.asr)
+        file_id = str(asr_inputs[0]["file_id"]) if asr_inputs else self._cached_file_id(asr_results)
+        return grouped.get(file_id, [])
+
+    def _cached_file_id(self, asr_results: Sequence[ASRResult]) -> str:
+        for result in asr_results:
+            if result.file_id:
+                return str(result.file_id)
+        return "__cached__"
+
     def process_files_batch(self, input_paths: Sequence[str | Path], rows: Optional[Sequence[Optional[dict]]] = None) -> list[Dict[str, Any]]:
         """Process a micro-batch of files with cross-file ASR and PII batching.
 
@@ -575,6 +673,7 @@ class PIIMaskingPipeline:
         used_combined_channel_extract: bool,
         unmapped_fallback_used: bool,
         batch_optimized: bool,
+        model_major_optimized: bool = False,
         perf_metrics: Optional[dict] = None,
     ) -> Dict[str, Any]:
         no_pii_fast_copy_used = False
@@ -685,6 +784,8 @@ class PIIMaskingPipeline:
             sidecar["optimizations"]["asr_file_microbatching"] = True
             sidecar["optimizations"]["pii_cross_file_batching"] = True
             sidecar["runtime_file_batch_size"] = int(getattr(self.config.runtime, "file_batch_size", 1))
+        if model_major_optimized:
+            sidecar["optimizations"]["model_major_schedule"] = True
         with self._time_perf_stage(perf_metrics, "sidecar_write"):
             write_json(sidecar_path, sidecar)
         return self._result_row(input_path, output_path, sidecar_path, elapsed, duration, transcripts, all_entities, merged_spans, validation, status, perf_metrics=perf_metrics)

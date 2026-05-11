@@ -7,6 +7,7 @@ import copy
 import yaml
 
 VALID_PERFORMANCE_PROFILES = {"default", "a10g_24gb"}
+VALID_PIPELINE_SCHEDULES = {"file_major", "model_major"}
 
 
 @dataclass
@@ -217,6 +218,7 @@ class RuntimeConfig:
     shard_index: int = 0
     shard_count: int = 1
     performance_profile: str = "default"  # default or a10g_24gb
+    pipeline_schedule: str = "file_major"  # file_major or model_major
 
     # True multi-file batching. This batches transcript-only ASR engines and neural PII
     # across several files while still using Whisper as the word-timestamp anchor.
@@ -228,6 +230,7 @@ class RuntimeConfig:
     adaptive_batch_min_size: int = 1
     min_free_gpu_mem_gb: float = 2.0
     write_perf_metrics: bool = False
+    delete_asr_cache_after_finalize: bool = False
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
     ffmpeg_threads: int = 1
@@ -342,6 +345,8 @@ def enabled_asr_engines(config: PipelineConfig) -> List[str]:
 def validate_config(config: PipelineConfig) -> PipelineConfig:
     if config.runtime.performance_profile not in VALID_PERFORMANCE_PROFILES:
         raise ValueError("runtime.performance_profile must be default or a10g_24gb")
+    if config.runtime.pipeline_schedule not in VALID_PIPELINE_SCHEDULES:
+        raise ValueError("runtime.pipeline_schedule must be file_major or model_major")
     if config.asr.mode not in {"per_channel", "mono_mix"}:
         raise ValueError("asr.mode must be 'per_channel' or 'mono_mix'")
     if config.asr.input_audio_strategy not in {"single_decode", "ffmpeg_temp_wav"}:

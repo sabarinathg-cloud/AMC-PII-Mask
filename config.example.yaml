@@ -173,6 +173,11 @@ runtime:
   shard_index: 0
   shard_count: 1
   performance_profile: default
+  # file_major processes each file through all enabled models before moving on.
+  # model_major runs one ASR model across all files, unloads it, then runs the next
+  # model and finalizes from the persisted ASR cache. Use model_major for large
+  # production batches on a single GPU when you want lower peak VRAM pressure.
+  pipeline_schedule: file_major
 
   # True multi-file microbatching. This batches transcript-only ASR engines
   # and PII detection across files. Keep conservative for long full-call audio
@@ -183,6 +188,9 @@ runtime:
   adaptive_batch_min_size: 1
   min_free_gpu_mem_gb: 2.0
   write_perf_metrics: false
+  # Model-major ASR cache contains raw transcripts. Keep false for crash-safe resume,
+  # set true when you want cache SQLite/WAL/SHM files deleted after a clean finalization.
+  delete_asr_cache_after_finalize: false
 
   # For a mostly free NVIDIA A10G 24 GB, start with:
   #   performance_profile: a10g_24gb

@@ -18,10 +18,12 @@ def test_config_example_exposes_pipeline_runtime_contract():
     assert cfg.runtime.file_batch_size == 2
     assert cfg.runtime.file_batch_max_decoded_audio_gb == 2.0
     assert cfg.runtime.write_perf_metrics is False
+    assert cfg.runtime.delete_asr_cache_after_finalize is False
     assert cfg.runtime.adaptive_file_batching is True
     assert cfg.runtime.adaptive_batch_min_size == 1
     assert cfg.runtime.min_free_gpu_mem_gb == 2.0
     assert cfg.runtime.performance_profile == "default"
+    assert cfg.runtime.pipeline_schedule == "file_major"
 
 
 def test_output_path_refuses_same_input_path_configuration(tmp_path):
@@ -60,4 +62,11 @@ def test_unknown_performance_profile_is_rejected():
     cfg = load_config(None)
     cfg.runtime.performance_profile = "mystery"
     with pytest.raises(ValueError, match="performance_profile"):
+        validate_config(cfg)
+
+
+def test_unknown_pipeline_schedule_is_rejected():
+    cfg = load_config(None)
+    cfg.runtime.pipeline_schedule = "sideways"
+    with pytest.raises(ValueError, match="pipeline_schedule"):
         validate_config(cfg)
