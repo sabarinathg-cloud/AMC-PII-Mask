@@ -114,7 +114,14 @@ class WhisperXForcedAligner:
             for parameter in signature.parameters.values()
         ):
             kwargs = {key: value for key, value in kwargs.items() if key in signature.parameters}
-        return self._whisperx.align(segments, model, metadata, waveform, device, **kwargs)
+        try:
+            return self._whisperx.align(segments, model, metadata, waveform, device, **kwargs)
+        except TypeError as exc:
+            if "batch_size" not in kwargs or "batch_size" not in str(exc):
+                raise
+            retry_kwargs = dict(kwargs)
+            retry_kwargs.pop("batch_size", None)
+            return self._whisperx.align(segments, model, metadata, waveform, device, **retry_kwargs)
 
     def _normalize_language(self, language: Optional[str]) -> str:
         value = str(language or self.default_language or "en").strip().lower()

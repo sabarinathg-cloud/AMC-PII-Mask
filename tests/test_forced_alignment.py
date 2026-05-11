@@ -72,6 +72,24 @@ class FakeWhisperXWithoutBatchSize(FakeWhisperX):
         }
 
 
+class FakeWhisperXWrapperRejectsBatchSize(FakeWhisperX):
+    def align(self, segments, model, metadata, audio, device, **kwargs):
+        if "batch_size" in kwargs:
+            raise TypeError("align() got an unexpected keyword argument 'batch_size'")
+        assert kwargs["return_char_alignments"] is False
+        assert model == "model-en"
+        return {
+            "segments": [
+                {
+                    "words": [
+                        {"word": "Hello", "start": 0.1, "end": 0.3, "score": 0.88},
+                        {"word": "John", "start": 0.35, "end": 0.6, "score": 0.77},
+                    ]
+                }
+            ]
+        }
+
+
 def test_whisperx_forced_aligner_caches_models_by_language():
     fake = FakeWhisperX()
     aligner = WhisperXForcedAligner(
@@ -109,6 +127,26 @@ def test_whisperx_forced_aligner_supports_align_api_without_batch_size():
         compute_type="float32",
         batch_size=4,
         whisperx_module=FakeWhisperXWithoutBatchSize(),
+    )
+
+    result = aligner.align(
+        audio=np.zeros(1600, dtype=np.float32),
+        sample_rate=16000,
+        transcript="Hello John",
+        language="en",
+        channel=0,
+    )
+
+    assert result.status == "aligned"
+    assert result.words[1]["word"] == "John"
+
+
+def test_whisperx_forced_aligner_retries_when_wrapper_rejects_batch_size():
+    aligner = WhisperXForcedAligner(
+        device="cpu",
+        compute_type="float32",
+        batch_size=4,
+        whisperx_module=FakeWhisperXWrapperRejectsBatchSize(),
     )
 
     result = aligner.align(
