@@ -172,12 +172,23 @@ runtime:
   limit: null
   shard_index: 0
   shard_count: 1
+  performance_profile: default
 
   # True multi-file microbatching. This batches transcript-only ASR engines
   # and PII detection across files. Keep conservative for long full-call audio
   # because decoded 48 kHz stereo buffers are held until the batch is finalized.
   file_batch_size: 2
   file_batch_max_decoded_audio_gb: 2.0
+  adaptive_file_batching: true
+  adaptive_batch_min_size: 1
+  min_free_gpu_mem_gb: 2.0
+  write_perf_metrics: false
+
+  # For a mostly free NVIDIA A10G 24 GB, start with:
+  #   performance_profile: a10g_24gb
+  # This applies file_batch_size=4, file_batch_max_decoded_audio_gb=4.0,
+  # PII batch_size=32, transcript-only ASR batch_size>=4, and perf metrics.
+  # Keep final_and_all_engines and mask_full_channel for production safety.
 
   ffmpeg_path: ffmpeg
   ffprobe_path: ffprobe

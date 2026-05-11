@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional
 import copy
 import yaml
 
+VALID_PERFORMANCE_PROFILES = {"default", "a10g_24gb"}
+
 
 @dataclass
 class PathConfig:
@@ -214,6 +216,7 @@ class RuntimeConfig:
     limit: Optional[int] = None
     shard_index: int = 0
     shard_count: int = 1
+    performance_profile: str = "default"  # default or a10g_24gb
 
     # True multi-file batching. This batches transcript-only ASR engines and neural PII
     # across several files while still using Whisper as the word-timestamp anchor.
@@ -221,6 +224,10 @@ class RuntimeConfig:
     # buffers are held until the batch is finalized.
     file_batch_size: int = 2
     file_batch_max_decoded_audio_gb: float = 2.0
+    adaptive_file_batching: bool = True
+    adaptive_batch_min_size: int = 1
+    min_free_gpu_mem_gb: float = 2.0
+    write_perf_metrics: bool = False
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
     ffmpeg_threads: int = 1
@@ -275,7 +282,7 @@ def _make_dataclass(cls, values: Dict[str, Any]):
     return cls(**clean)
 
 
-def load_config(path: Optional[str | Path] = None) -> PipelineConfig:
+def load_config(path: Optional[str | Path] = None, apply_profile: bool = True) -> PipelineConfig:
     default = _dataclass_to_dict(PipelineConfig())
     if path is not None:
         with open(path, "r", encoding="utf-8") as f:
@@ -291,7 +298,39 @@ def load_config(path: Optional[str | Path] = None) -> PipelineConfig:
         masking=_make_dataclass(MaskingConfig, merged.get("masking", {})),
         runtime=_make_dataclass(RuntimeConfig, merged.get("runtime", {})),
     )
+    if apply_profile:
+        apply_performance_profile(config)
     return validate_config(config)
+
+
+def apply_performance_profile(config: PipelineConfig) -> PipelineConfig:
+    profile = str(getattr(config.runtime, "performance_profile", "default") or "default")
+    if profile == "default":
+        return config
+    if profile not in VALID_PERFORMANCE_PROFILES:
+        raise ValueError("runtime.performance_profile must be default or a10g_24gb")
+
+    config.asr.model_residency = "keep_loaded"
+    config.runtime.file_batch_size = 4
+    config.runtime.file_batch_max_decoded_audio_gb = 4.0
+    config.runtime.adaptive_file_batching = True
+    config.runtime.adaptive_batch_min_size = 1
+    config.runtime.min_free_gpu_mem_gb = 3.0
+    config.runtime.write_perf_metrics = True
+    config.pii.batch_size = 32
+
+    whisper = config.asr.engines.get("whisper", {})
+    whisper["batch_size"] = max(8, int(whisper.get("batch_size", 8)))
+    whisper["use_batched_pipeline"] = True
+    config.asr.engines["whisper"] = whisper
+
+    for engine_name in ("qwen", "cohere", "granite"):
+        if engine_name not in config.asr.engines:
+            continue
+        engine_cfg = config.asr.engines[engine_name]
+        engine_cfg["batch_size"] = max(4, int(engine_cfg.get("batch_size", 2)))
+        config.asr.engines[engine_name] = engine_cfg
+    return config
 
 
 def enabled_asr_engines(config: PipelineConfig) -> List[str]:
@@ -301,6 +340,8 @@ def enabled_asr_engines(config: PipelineConfig) -> List[str]:
 
 
 def validate_config(config: PipelineConfig) -> PipelineConfig:
+    if config.runtime.performance_profile not in VALID_PERFORMANCE_PROFILES:
+        raise ValueError("runtime.performance_profile must be default or a10g_24gb")
     if config.asr.mode not in {"per_channel", "mono_mix"}:
         raise ValueError("asr.mode must be 'per_channel' or 'mono_mix'")
     if config.asr.input_audio_strategy not in {"single_decode", "ffmpeg_temp_wav"}:
@@ -377,8 +418,12 @@ def validate_config(config: PipelineConfig) -> PipelineConfig:
         raise ValueError("runtime.shard_index must satisfy 0 <= shard_index < shard_count")
     if int(getattr(config.runtime, "file_batch_size", 1)) < 1:
         raise ValueError("runtime.file_batch_size must be >= 1")
+    if int(getattr(config.runtime, "adaptive_batch_min_size", 1)) < 1:
+        raise ValueError("runtime.adaptive_batch_min_size must be >= 1")
     if float(getattr(config.runtime, "file_batch_max_decoded_audio_gb", 0.0)) <= 0:
         raise ValueError("runtime.file_batch_max_decoded_audio_gb must be > 0")
+    if float(getattr(config.runtime, "min_free_gpu_mem_gb", 0.0)) < 0:
+        raise ValueError("runtime.min_free_gpu_mem_gb must be >= 0")
     if config.runtime.unmasked_copy_method not in {"hardlink_or_copy", "copy"}:
         raise ValueError("runtime.unmasked_copy_method must be hardlink_or_copy or copy. Symlinks are not allowed for deliverable audio.")
 

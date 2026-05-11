@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
+import json
 import logging
 import tempfile
 import time
@@ -37,6 +39,127 @@ class PIIMaskingPipeline:
         self.asr = MultiASRTranscriber(config.asr)
         self.detector = PIIDetector(config.pii)
 
+    def _perf_enabled(self) -> bool:
+        return bool(getattr(self.config.runtime, "write_perf_metrics", False))
+
+    def _new_perf_metrics(self) -> Optional[dict]:
+        if not self._perf_enabled():
+            return None
+        return {
+            "stages_sec": {},
+            "cuda_memory": [],
+            "adaptive_batching": [],
+        }
+
+    @contextmanager
+    def _time_perf_stage(self, metrics: Optional[dict], stage: str):
+        if metrics is None:
+            yield
+            return
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            stages = metrics.setdefault("stages_sec", {})
+            stages[stage] = float(stages.get(stage, 0.0) + (time.perf_counter() - started))
+
+    def _record_cuda_memory(self, metrics: Optional[dict], label: str) -> None:
+        if metrics is None:
+            return
+        snapshot: dict[str, Any] = {"label": label, "available": False}
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                snapshot.update({
+                    "available": True,
+                    "free_gb": free_bytes / (1024.0 ** 3),
+                    "total_gb": total_bytes / (1024.0 ** 3),
+                    "allocated_gb": torch.cuda.memory_allocated() / (1024.0 ** 3),
+                    "reserved_gb": torch.cuda.memory_reserved() / (1024.0 ** 3),
+                })
+        except Exception as exc:
+            snapshot["error"] = repr(exc)
+        metrics.setdefault("cuda_memory", []).append(snapshot)
+
+    def _cuda_free_memory_gb(self) -> Optional[float]:
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return None
+            free_bytes, _ = torch.cuda.mem_get_info()
+            return free_bytes / (1024.0 ** 3)
+        except Exception:
+            return None
+
+    def _adapt_file_batch_size(self, current_size: int, free_gpu_mem_gb: Optional[float]) -> int:
+        current_size = max(1, int(current_size))
+        if not bool(getattr(self.config.runtime, "adaptive_file_batching", True)):
+            return current_size
+        if free_gpu_mem_gb is None:
+            return current_size
+        min_free = float(getattr(self.config.runtime, "min_free_gpu_mem_gb", 0.0))
+        min_size = max(1, int(getattr(self.config.runtime, "adaptive_batch_min_size", 1)))
+        if free_gpu_mem_gb >= min_free or current_size <= min_size:
+            return current_size
+        return max(min_size, current_size // 2)
+
+    def _recover_file_batch_size(self, current_size: int, configured_size: int, free_gpu_mem_gb: Optional[float]) -> int:
+        current_size = max(1, int(current_size))
+        configured_size = max(current_size, int(configured_size))
+        if not bool(getattr(self.config.runtime, "adaptive_file_batching", True)):
+            return current_size
+        if free_gpu_mem_gb is None or current_size >= configured_size:
+            return current_size
+        min_free = float(getattr(self.config.runtime, "min_free_gpu_mem_gb", 0.0))
+        if free_gpu_mem_gb < min_free:
+            return current_size
+        return min(configured_size, max(current_size + 1, current_size * 2))
+
+    def _suggest_file_batch_size(self, current_size: int, metrics: Optional[dict] = None) -> int:
+        free_gb = self._cuda_free_memory_gb()
+        next_size = self._adapt_file_batch_size(current_size, free_gb)
+        if metrics is not None and next_size != current_size:
+            metrics.setdefault("adaptive_batching", []).append({
+                "from": int(current_size),
+                "to": int(next_size),
+                "free_gpu_mem_gb": free_gb,
+                "min_free_gpu_mem_gb": float(getattr(self.config.runtime, "min_free_gpu_mem_gb", 0.0)),
+            })
+        return next_size
+
+    def _merge_perf_metrics(self, target: Optional[dict], source: Optional[dict]) -> None:
+        if target is None or source is None:
+            return
+        for stage, value in (source.get("stages_sec") or {}).items():
+            stages = target.setdefault("stages_sec", {})
+            stages[stage] = float(stages.get(stage, 0.0) + float(value))
+        target.setdefault("cuda_memory", []).extend(source.get("cuda_memory") or [])
+        target.setdefault("adaptive_batching", []).extend(source.get("adaptive_batching") or [])
+        if source.get("asr_engine_sec"):
+            engine_times = target.setdefault("asr_engine_sec", {})
+            for engine, value in source["asr_engine_sec"].items():
+                engine_times[engine] = float(engine_times.get(engine, 0.0) + float(value))
+
+    def _merge_batch_perf_metrics(self, target: Optional[dict], source: Optional[dict]) -> None:
+        if target is None or source is None:
+            return
+        for stage, value in (source.get("stages_sec") or {}).items():
+            stages = target.setdefault("batch_stages_sec", {})
+            stages[stage] = float(stages.get(stage, 0.0) + float(value))
+        target.setdefault("cuda_memory", []).extend(source.get("cuda_memory") or [])
+        target.setdefault("adaptive_batching", []).extend(source.get("adaptive_batching") or [])
+        if source.get("asr_engine_sec"):
+            engine_times = target.setdefault("asr_engine_sec", {})
+            for engine, value in source["asr_engine_sec"].items():
+                engine_times[engine] = float(engine_times.get(engine, 0.0) + float(value))
+        if source.get("batch_size"):
+            target["batch_size"] = int(source["batch_size"])
+        target["batch_metrics_semantics"] = (
+            "batch_stages_sec values are full micro-batch wall times shared by every file "
+            "in the batch; do not sum batch_stages_sec across co-batch files."
+        )
+
     def output_path_for(self, input_path: str | Path) -> Path:
         input_path = Path(input_path)
         if self.config.paths.preserve_relative_path:
@@ -67,6 +190,8 @@ class PIIMaskingPipeline:
     def process_file(self, input_path: str | Path, row: Optional[dict] = None) -> Dict[str, Any]:
         input_path = Path(input_path)
         started = time.time()
+        perf_metrics = self._new_perf_metrics()
+        self._record_cuda_memory(perf_metrics, "file_start")
         output_path = self.output_path_for(input_path)
         sidecar_path = self.sidecar_path_for(output_path)
         if input_path.resolve() == output_path.resolve():
@@ -74,7 +199,8 @@ class PIIMaskingPipeline:
                 f"Refusing to overwrite original audio. Configure paths.output_root outside the input file path: {input_path}"
             )
 
-        meta = ffprobe_audio(input_path, ffprobe_path=self.config.runtime.ffprobe_path)
+        with self._time_perf_stage(perf_metrics, "ffprobe"):
+            meta = ffprobe_audio(input_path, ffprobe_path=self.config.runtime.ffprobe_path)
 
         if self._should_skip_existing(input_path, output_path, sidecar_path, meta):
             return {
@@ -114,33 +240,41 @@ class PIIMaskingPipeline:
                 strategy = "ffmpeg_temp_wav"
 
         if strategy == "single_decode":
-            audio_48k = decode_to_float32_stereo_48k(
-                input_path,
-                ffmpeg_path=self.config.runtime.ffmpeg_path,
-                threads=self.config.runtime.ffmpeg_threads,
-                sample_rate=self.config.masking.output_sample_rate,
-                channels=self.config.masking.output_channels,
-            )
+            with self._time_perf_stage(perf_metrics, "decode"):
+                audio_48k = decode_to_float32_stereo_48k(
+                    input_path,
+                    ffmpeg_path=self.config.runtime.ffmpeg_path,
+                    threads=self.config.runtime.ffmpeg_threads,
+                    sample_rate=self.config.masking.output_sample_rate,
+                    channels=self.config.masking.output_channels,
+                )
             used_single_decode = True
-            asr_inputs = make_asr_audio_inputs(
-                audio_48k,
-                mode=self.config.asr.mode,
-                input_channels=channel_count,
-                source_sr=self.config.masking.output_sample_rate,
-                target_sr=self.config.asr.channel_wav_sample_rate,
-            )
-            results = self._transcribe_asr_inputs(asr_inputs)
-            unmapped_fallback_used = self._handle_asr_results(results, transcripts, all_entities, raw_spans, row, duration) or unmapped_fallback_used
+            with self._time_perf_stage(perf_metrics, "asr_input_prep"):
+                asr_inputs = make_asr_audio_inputs(
+                    audio_48k,
+                    mode=self.config.asr.mode,
+                    input_channels=channel_count,
+                    source_sr=self.config.masking.output_sample_rate,
+                    target_sr=self.config.asr.channel_wav_sample_rate,
+                )
+            with self._time_perf_stage(perf_metrics, "asr"):
+                results = self._transcribe_asr_inputs(asr_inputs)
+            if hasattr(self.asr, "last_engine_timings_sec") and perf_metrics is not None:
+                perf_metrics["asr_engine_sec"] = dict(getattr(self.asr, "last_engine_timings_sec", {}) or {})
+            self._record_cuda_memory(perf_metrics, "after_asr")
+            with self._time_perf_stage(perf_metrics, "pii_detection_and_mapping"):
+                unmapped_fallback_used = self._handle_asr_results(results, transcripts, all_entities, raw_spans, row, duration) or unmapped_fallback_used
         elif strategy == "ffmpeg_temp_wav":
-            used_combined_channel_extract, temp_fallback_used = self._process_with_temp_wavs(
-                input_path=input_path,
-                channel_count=channel_count,
-                row=row,
-                duration=duration,
-                transcripts=transcripts,
-                all_entities=all_entities,
-                raw_spans=raw_spans,
-            )
+            with self._time_perf_stage(perf_metrics, "ffmpeg_temp_wav_asr"):
+                used_combined_channel_extract, temp_fallback_used = self._process_with_temp_wavs(
+                    input_path=input_path,
+                    channel_count=channel_count,
+                    row=row,
+                    duration=duration,
+                    transcripts=transcripts,
+                    all_entities=all_entities,
+                    raw_spans=raw_spans,
+                )
             unmapped_fallback_used = unmapped_fallback_used or temp_fallback_used
         else:
             raise ValueError(f"Unsupported asr.input_audio_strategy: {strategy}")
@@ -160,6 +294,7 @@ class PIIMaskingPipeline:
             used_combined_channel_extract=used_combined_channel_extract,
             unmapped_fallback_used=unmapped_fallback_used,
             batch_optimized=False,
+            perf_metrics=perf_metrics,
         )
 
     def process_files_batch(self, input_paths: Sequence[str | Path], rows: Optional[Sequence[Optional[dict]]] = None) -> list[Dict[str, Any]]:
@@ -185,7 +320,41 @@ class PIIMaskingPipeline:
         if strategy != "single_decode":
             return [self.process_file(path, row=row) for path, row in zip(paths, row_list)]
 
-        estimated_gb = self._estimate_decoded_batch_gb(paths)
+        batch_metrics = self._new_perf_metrics()
+        adapted_size = self._suggest_file_batch_size(len(paths), batch_metrics)
+        if adapted_size < len(paths):
+            out: list[Dict[str, Any]] = []
+            for start in range(0, len(paths), adapted_size):
+                out.extend(self.process_files_batch(paths[start:start + adapted_size], rows=row_list[start:start + adapted_size]))
+            return out
+
+        result_slots: list[Optional[Dict[str, Any]]] = [None] * len(paths)
+        perf_by_index = [self._new_perf_metrics() for _ in paths]
+        metas_by_index: list[Optional[dict]] = [None] * len(paths)
+        total_seconds = 0.0
+        estimate_unknown = False
+
+        for idx, input_path in enumerate(paths):
+            try:
+                with self._time_perf_stage(perf_by_index[idx], "ffprobe"):
+                    meta = ffprobe_audio(input_path, ffprobe_path=self.config.runtime.ffprobe_path)
+                metas_by_index[idx] = meta
+                duration = meta.get("duration_sec")
+                if duration is None:
+                    estimate_unknown = True
+                else:
+                    total_seconds += float(duration)
+            except Exception as e:
+                if self.config.runtime.fail_fast:
+                    raise
+                self._delete_partial_outputs_silent(input_path)
+                result_slots[idx] = self._failed_result(input_path, repr(e))
+
+        if estimate_unknown:
+            estimated_gb = None
+        else:
+            bytes_needed = total_seconds * float(self.config.masking.output_sample_rate) * float(self.config.masking.output_channels) * 4.0
+            estimated_gb = bytes_needed / (1024.0 ** 3)
         max_gb = float(getattr(self.config.runtime, "file_batch_max_decoded_audio_gb", 2.0))
         if estimated_gb is not None and estimated_gb > max_gb:
             logger.warning(
@@ -193,15 +362,22 @@ class PIIMaskingPipeline:
                 estimated_gb,
                 max_gb,
             )
-            return [self.process_file(path, row=row) for path, row in zip(paths, row_list)]
+            for idx, (path, row) in enumerate(zip(paths, row_list)):
+                if result_slots[idx] is None:
+                    result_slots[idx] = self.process_file(path, row=row)
+            return [r for r in result_slots if r is not None]
 
-        result_slots: list[Optional[Dict[str, Any]]] = [None] * len(paths)
         contexts: dict[str, dict] = {}
         batch_asr_inputs: list[dict] = []
         max_single_decode = getattr(self.config.asr, "single_decode_max_audio_seconds", None)
 
         for idx, (input_path, row) in enumerate(zip(paths, row_list)):
+            if result_slots[idx] is not None:
+                continue
             started = time.time()
+            perf_metrics = perf_by_index[idx]
+            self._merge_perf_metrics(perf_metrics, batch_metrics)
+            self._record_cuda_memory(perf_metrics, "file_batch_prepare_start")
             try:
                 output_path = self.output_path_for(input_path)
                 sidecar_path = self.sidecar_path_for(output_path)
@@ -210,7 +386,9 @@ class PIIMaskingPipeline:
                         f"Refusing to overwrite original audio. Configure paths.output_root outside the input file path: {input_path}"
                     )
 
-                meta = ffprobe_audio(input_path, ffprobe_path=self.config.runtime.ffprobe_path)
+                meta = metas_by_index[idx]
+                if meta is None:
+                    raise RuntimeError("Missing cached ffprobe metadata for batch item")
                 if self._should_skip_existing(input_path, output_path, sidecar_path, meta):
                     result_slots[idx] = {
                         "input_path": str(input_path),
@@ -232,20 +410,22 @@ class PIIMaskingPipeline:
 
                 n_input_channels = int(meta.get("channels") or 1)
                 channel_count = min(2, max(1, n_input_channels))
-                audio_48k = decode_to_float32_stereo_48k(
-                    input_path,
-                    ffmpeg_path=self.config.runtime.ffmpeg_path,
-                    threads=self.config.runtime.ffmpeg_threads,
-                    sample_rate=self.config.masking.output_sample_rate,
-                    channels=self.config.masking.output_channels,
-                )
-                asr_inputs = make_asr_audio_inputs(
-                    audio_48k,
-                    mode=self.config.asr.mode,
-                    input_channels=channel_count,
-                    source_sr=self.config.masking.output_sample_rate,
-                    target_sr=self.config.asr.channel_wav_sample_rate,
-                )
+                with self._time_perf_stage(perf_metrics, "decode"):
+                    audio_48k = decode_to_float32_stereo_48k(
+                        input_path,
+                        ffmpeg_path=self.config.runtime.ffmpeg_path,
+                        threads=self.config.runtime.ffmpeg_threads,
+                        sample_rate=self.config.masking.output_sample_rate,
+                        channels=self.config.masking.output_channels,
+                    )
+                with self._time_perf_stage(perf_metrics, "asr_input_prep"):
+                    asr_inputs = make_asr_audio_inputs(
+                        audio_48k,
+                        mode=self.config.asr.mode,
+                        input_channels=channel_count,
+                        source_sr=self.config.masking.output_sample_rate,
+                        target_sr=self.config.asr.channel_wav_sample_rate,
+                    )
 
                 file_id = str(idx)
                 for item in asr_inputs:
@@ -268,6 +448,7 @@ class PIIMaskingPipeline:
                     "unmapped_fallback_used": False,
                     "used_single_decode": True,
                     "used_combined_channel_extract": False,
+                    "perf_metrics": perf_metrics,
                 }
             except Exception as e:
                 if self.config.runtime.fail_fast:
@@ -277,11 +458,21 @@ class PIIMaskingPipeline:
 
         if batch_asr_inputs:
             try:
-                bundles_by_file = self.asr.transcribe_channel_batch(
-                    batch_asr_inputs,
-                    work_dir=Path(self.config.paths.work_dir),
-                    keep_temp=bool(self.config.runtime.keep_temp),
-                )
+                asr_batch_metrics = self._new_perf_metrics()
+                self._record_cuda_memory(asr_batch_metrics, "before_asr_batch")
+                with self._time_perf_stage(asr_batch_metrics, "asr_batch"):
+                    bundles_by_file = self.asr.transcribe_channel_batch(
+                        batch_asr_inputs,
+                        work_dir=Path(self.config.paths.work_dir),
+                        keep_temp=bool(self.config.runtime.keep_temp),
+                    )
+                self._record_cuda_memory(asr_batch_metrics, "after_asr_batch")
+                if hasattr(self.asr, "last_engine_timings_sec") and asr_batch_metrics is not None:
+                    asr_batch_metrics["asr_engine_sec"] = dict(getattr(self.asr, "last_engine_timings_sec", {}) or {})
+                if asr_batch_metrics is not None:
+                    asr_batch_metrics["batch_size"] = len(contexts)
+                for ctx in contexts.values():
+                    self._merge_batch_perf_metrics(ctx.get("perf_metrics"), asr_batch_metrics)
             except Exception as e:
                 logger.warning("ASR micro-batch failed; falling back to file-by-file processing. Error: %s", e)
                 for file_id, ctx in contexts.items():
@@ -308,7 +499,15 @@ class PIIMaskingPipeline:
             if detection_items:
                 texts = [d["text"] for d in detection_items]
                 pii_rows = [contexts[str(d["file_id"])].get("row") for d in detection_items]
-                detected_batches = self.detector.detect_batch(texts, rows=pii_rows)
+                pii_batch_metrics = self._new_perf_metrics()
+                self._record_cuda_memory(pii_batch_metrics, "before_pii_batch")
+                with self._time_perf_stage(pii_batch_metrics, "pii_detection_batch"):
+                    detected_batches = self.detector.detect_batch(texts, rows=pii_rows)
+                self._record_cuda_memory(pii_batch_metrics, "after_pii_batch")
+                if pii_batch_metrics is not None:
+                    pii_batch_metrics["batch_size"] = len(contexts)
+                for ctx in contexts.values():
+                    self._merge_batch_perf_metrics(ctx.get("perf_metrics"), pii_batch_metrics)
                 for item, entities in zip(detection_items, detected_batches):
                     file_id = str(item["file_id"])
                     ctx = contexts[file_id]
@@ -349,6 +548,7 @@ class PIIMaskingPipeline:
                         used_combined_channel_extract=bool(ctx.get("used_combined_channel_extract", False)),
                         unmapped_fallback_used=bool(ctx.get("unmapped_fallback_used", False)),
                         batch_optimized=True,
+                        perf_metrics=ctx.get("perf_metrics"),
                     )
                     ctx["audio_48k"] = None
                 except Exception as e:
@@ -375,6 +575,7 @@ class PIIMaskingPipeline:
         used_combined_channel_extract: bool,
         unmapped_fallback_used: bool,
         batch_optimized: bool,
+        perf_metrics: Optional[dict] = None,
     ) -> Dict[str, Any]:
         no_pii_fast_copy_used = False
 
@@ -404,14 +605,26 @@ class PIIMaskingPipeline:
             target_channels=self.config.masking.target_channels,
         )
 
-        if not merged_spans and self.config.runtime.copy_unmasked_when_no_pii and self.config.masking.copy_input_if_no_pii:
-            if input_matches_required_opus(
-                meta,
-                sample_rate=self.config.masking.output_sample_rate,
-                channels=self.config.masking.output_channels,
-            ):
-                copy_audio_passthrough(input_path, output_path, method=self.config.runtime.unmasked_copy_method)
-                no_pii_fast_copy_used = True
+        with self._time_perf_stage(perf_metrics, "mask_copy_encode"):
+            if not merged_spans and self.config.runtime.copy_unmasked_when_no_pii and self.config.masking.copy_input_if_no_pii:
+                if input_matches_required_opus(
+                    meta,
+                    sample_rate=self.config.masking.output_sample_rate,
+                    channels=self.config.masking.output_channels,
+                ):
+                    copy_audio_passthrough(input_path, output_path, method=self.config.runtime.unmasked_copy_method)
+                    no_pii_fast_copy_used = True
+                else:
+                    if audio_48k is None:
+                        audio_48k = decode_to_float32_stereo_48k(
+                            input_path,
+                            ffmpeg_path=self.config.runtime.ffmpeg_path,
+                            threads=self.config.runtime.ffmpeg_threads,
+                            sample_rate=self.config.masking.output_sample_rate,
+                            channels=self.config.masking.output_channels,
+                        )
+                    self._encode(audio_48k, output_path, meta)
+                status = "success_no_pii_fast_copy" if no_pii_fast_copy_used else "success_no_pii_transcoded"
             else:
                 if audio_48k is None:
                     audio_48k = decode_to_float32_stereo_48k(
@@ -421,44 +634,34 @@ class PIIMaskingPipeline:
                         sample_rate=self.config.masking.output_sample_rate,
                         channels=self.config.masking.output_channels,
                     )
-                self._encode(audio_48k, output_path, meta)
-            status = "success_no_pii_fast_copy" if no_pii_fast_copy_used else "success_no_pii_transcoded"
-        else:
-            if audio_48k is None:
-                audio_48k = decode_to_float32_stereo_48k(
-                    input_path,
-                    ffmpeg_path=self.config.runtime.ffmpeg_path,
-                    threads=self.config.runtime.ffmpeg_threads,
-                    sample_rate=self.config.masking.output_sample_rate,
-                    channels=self.config.masking.output_channels,
+                masked = apply_mask_spans(
+                    audio_48k,
+                    merged_spans,
+                    sr=self.config.masking.output_sample_rate,
+                    mode=self.config.masking.mode,
+                    target_channels=self.config.masking.target_channels,
+                    beep_freq_hz=self.config.masking.beep_freq_hz,
+                    beep_gain=self.config.masking.beep_gain,
+                    noise_gain=self.config.masking.noise_gain,
+                    fade_ms=self.config.masking.fade_ms,
+                    random_seed=self.config.runtime.random_seed,
+                    inplace=True,
                 )
-            masked = apply_mask_spans(
-                audio_48k,
-                merged_spans,
-                sr=self.config.masking.output_sample_rate,
-                mode=self.config.masking.mode,
-                target_channels=self.config.masking.target_channels,
-                beep_freq_hz=self.config.masking.beep_freq_hz,
-                beep_gain=self.config.masking.beep_gain,
-                noise_gain=self.config.masking.noise_gain,
-                fade_ms=self.config.masking.fade_ms,
-                random_seed=self.config.runtime.random_seed,
-                inplace=True,
-            )
-            self._encode(masked, output_path, meta)
-            status = "success_unmapped_fallback" if unmapped_fallback_used else "success"
+                self._encode(masked, output_path, meta)
+                status = "success_unmapped_fallback" if unmapped_fallback_used else "success"
 
-        if self.config.runtime.validate_outputs:
-            validation = validate_masked_file(
-                input_path,
-                output_path,
-                ffprobe_path=self.config.runtime.ffprobe_path,
-                expected_sample_rate=self.config.masking.output_sample_rate,
-                expected_channels=self.config.masking.output_channels,
-                input_meta=meta,
-            )
-        else:
-            validation = {"valid": True, "validation_skipped": True, "checks": {}}
+        with self._time_perf_stage(perf_metrics, "validation"):
+            if self.config.runtime.validate_outputs:
+                validation = validate_masked_file(
+                    input_path,
+                    output_path,
+                    ffprobe_path=self.config.runtime.ffprobe_path,
+                    expected_sample_rate=self.config.masking.output_sample_rate,
+                    expected_channels=self.config.masking.output_channels,
+                    input_meta=meta,
+                )
+            else:
+                validation = {"valid": True, "validation_skipped": True, "checks": {}}
 
         elapsed = time.time() - float(started)
         sidecar = self._build_sidecar(
@@ -476,13 +679,15 @@ class PIIMaskingPipeline:
             used_combined_channel_extract=used_combined_channel_extract,
             unmapped_fallback_used=unmapped_fallback_used,
             no_pii_fast_copy_used=no_pii_fast_copy_used,
+            perf_metrics=perf_metrics,
         )
         if batch_optimized:
             sidecar["optimizations"]["asr_file_microbatching"] = True
             sidecar["optimizations"]["pii_cross_file_batching"] = True
             sidecar["runtime_file_batch_size"] = int(getattr(self.config.runtime, "file_batch_size", 1))
-        write_json(sidecar_path, sidecar)
-        return self._result_row(input_path, output_path, sidecar_path, elapsed, duration, transcripts, all_entities, merged_spans, validation, status)
+        with self._time_perf_stage(perf_metrics, "sidecar_write"):
+            write_json(sidecar_path, sidecar)
+        return self._result_row(input_path, output_path, sidecar_path, elapsed, duration, transcripts, all_entities, merged_spans, validation, status, perf_metrics=perf_metrics)
 
     def _estimate_decoded_batch_gb(self, paths: Sequence[Path]) -> Optional[float]:
         total_seconds = 0.0
@@ -875,8 +1080,9 @@ class PIIMaskingPipeline:
         used_combined_channel_extract: bool,
         unmapped_fallback_used: bool,
         no_pii_fast_copy_used: bool,
+        perf_metrics: Optional[dict] = None,
     ) -> dict:
-        return {
+        sidecar = {
             "input_path": str(input_path),
             "output_path": str(output_path),
             "status": status,
@@ -912,6 +1118,9 @@ class PIIMaskingPipeline:
             "merged_spans": merged_spans,
             "validation": validation,
         }
+        if perf_metrics is not None:
+            sidecar["perf_metrics"] = perf_metrics
+        return sidecar
 
     def _result_row(
         self,
@@ -925,8 +1134,9 @@ class PIIMaskingPipeline:
         merged_spans: list[dict],
         validation: dict,
         status: str,
+        perf_metrics: Optional[dict] = None,
     ) -> Dict[str, Any]:
-        return {
+        row = {
             "input_path": str(input_path),
             "output_path": str(output_path),
             "sidecar_path": str(sidecar_path),
@@ -938,6 +1148,9 @@ class PIIMaskingPipeline:
             "num_spans": len(merged_spans),
             "valid": validation.get("valid"),
         }
+        if perf_metrics is not None:
+            row["perf_metrics_json"] = json.dumps(perf_metrics, sort_keys=True)
+        return row
 
     def _bundle_to_transcript_dict(self, bundle: ChannelASRBundle) -> Dict[str, Any]:
         engine_rows = [self._asr_result_to_dict(r) for r in bundle.engine_results]

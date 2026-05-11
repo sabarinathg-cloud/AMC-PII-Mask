@@ -8,6 +8,7 @@ import gc
 import logging
 import math
 import re
+import time
 import wave
 
 import numpy as np
@@ -869,6 +870,7 @@ class MultiASRTranscriber:
         if not self.enabled_names:
             raise ValueError("No ASR engines are enabled. Enable at least asr.engines.whisper.enabled=true.")
         self._loaded: Dict[str, Any] = {}
+        self.last_engine_timings_sec: Dict[str, float] = {}
         logger.info("Enabled ASR engines: %s", ", ".join(self.enabled_names))
 
     def _engine_kind(self, name: str) -> str:
@@ -947,8 +949,10 @@ class MultiASRTranscriber:
 
         all_results: list[ASRResult] = []
         fail_on_engine_error = bool(_cfg_get(self.cfg, "fail_on_engine_error", False))
+        self.last_engine_timings_sec = {}
         try:
             for name in self.enabled_names:
+                engine_started = time.perf_counter()
                 engine = self._get_engine(name)
                 try:
                     if getattr(engine, "supports_audio_input", False):
@@ -984,6 +988,8 @@ class MultiASRTranscriber:
                     logger.warning("ASR engine=%s failed for this micro-batch: %s", name, e)
                     for item in items:
                         all_results.append(ASRResult(file_id=str(item["file_id"]), channel=int(item["channel"]), transcript="", words=[], engine=name, error=repr(e)))
+                finally:
+                    self.last_engine_timings_sec[name] = time.perf_counter() - engine_started
 
             grouped = self._bundle_results_by_file(all_results, items)
             anchor_name = str(_cfg_get(self.cfg, "timestamp_anchor_engine", "whisper"))
