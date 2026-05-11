@@ -245,7 +245,7 @@ class RuntimeConfig:
     write_csv_reports: bool = True
     validate_outputs: bool = True
     validate_existing_outputs: bool = True
-    sidecar_include_words: bool = False
+    sidecar_include_words: bool = True
     atomic_output: bool = True
     copy_unmasked_when_no_pii: bool = True
     unmasked_copy_method: str = "hardlink_or_copy"

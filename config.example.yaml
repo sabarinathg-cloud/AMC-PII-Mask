@@ -223,8 +223,9 @@ runtime:
   # Atomic writes avoid corrupt outputs if a worker is killed mid-encode.
   atomic_output: true
 
-  # False keeps sidecars small. Set true only for debugging timestamp alignment.
-  sidecar_include_words: false
+  # Keep word timestamps and word confidence in sidecars for auditability.
+  # Sidecars contain transcript text and should be treated as sensitive.
+  sidecar_include_words: true
 
   # Keep CSV memory bounded. Full report is always available as JSONL.
   max_csv_report_rows: 10000

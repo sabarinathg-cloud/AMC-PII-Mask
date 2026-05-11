@@ -298,9 +298,9 @@ Every output gets:
 <masked_audio>.pii_masking.json
 ```
 
-The sidecar includes input metadata, consensus transcripts, per-engine transcripts, PII entities, raw spans, merged spans, validation, and optimization flags.
+The sidecar includes input metadata, consensus transcripts, per-engine transcripts, PII entities, raw spans, merged spans, validation, and optimization flags. Transcript rows include word-level confidence when the ASR engine provides it, plus a `transcript_confidence` summary computed from word probabilities. PII audit fields show which detector found each entity (`source`), which ASR transcript it came from (`asr_engine` / `transcript_source`), and whether every detected entity was covered by timestamp masking or full-channel fallback.
 
-Set this only for debugging:
+Word details are enabled by default for auditability:
 
 ```yaml
 runtime:

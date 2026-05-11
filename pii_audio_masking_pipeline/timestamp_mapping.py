@@ -52,11 +52,31 @@ def entities_to_spans(
             "text": ent.get("text", ""),
             "source": ent.get("source", "unknown"),
             "score": ent.get("score"),
+            "entity_id": ent.get("entity_id"),
+            "asr_engine": ent.get("asr_engine"),
+            "transcript_source": ent.get("transcript_source"),
         })
     return spans
 
 
 def merge_spans(spans: Iterable[dict], merge_gap_sec: float = 0.05, target_channels: str = "detected_channel") -> List[Dict[str, Any]]:
+    def span_entity_ids(row: dict) -> set[str]:
+        ids: set[str] = set()
+        if row.get("entity_id"):
+            ids.add(str(row["entity_id"]))
+        for entity_id in row.get("entity_ids") or []:
+            if entity_id:
+                ids.add(str(entity_id))
+        return ids
+
+    def finalize(row: dict, entity_ids: set[str], types: set[str], sources: set[str], texts: list[str]) -> dict:
+        row["types"] = sorted(types)
+        row["sources"] = sorted(sources)
+        row["texts"] = texts
+        row["entity_ids"] = sorted(entity_ids)
+        row["entity_id"] = row["entity_ids"][0] if len(row["entity_ids"]) == 1 else None
+        return row
+
     rows = []
     for s in spans:
         row = dict(s)
@@ -73,6 +93,7 @@ def merge_spans(spans: Iterable[dict], merge_gap_sec: float = 0.05, target_chann
     cur_types = {str(cur.get("type", "PII"))}
     cur_sources = {str(cur.get("source", "unknown"))}
     cur_texts = [str(cur.get("text", ""))]
+    cur_entity_ids = span_entity_ids(cur)
 
     for row in rows[1:]:
         same_channel = int(row.get("channel", -1)) == int(cur.get("channel", -1))
@@ -82,21 +103,17 @@ def merge_spans(spans: Iterable[dict], merge_gap_sec: float = 0.05, target_chann
             cur["duration"] = float(cur["end"]) - float(cur["start"])
             cur_types.add(str(row.get("type", "PII")))
             cur_sources.add(str(row.get("source", "unknown")))
+            cur_entity_ids.update(span_entity_ids(row))
             txt = str(row.get("text", ""))
             if txt:
                 cur_texts.append(txt)
         else:
-            cur["types"] = sorted(cur_types)
-            cur["sources"] = sorted(cur_sources)
-            cur["texts"] = cur_texts
-            merged.append(cur)
+            merged.append(finalize(cur, cur_entity_ids, cur_types, cur_sources, cur_texts))
             cur = row
             cur_types = {str(cur.get("type", "PII"))}
             cur_sources = {str(cur.get("source", "unknown"))}
             cur_texts = [str(cur.get("text", ""))]
+            cur_entity_ids = span_entity_ids(cur)
 
-    cur["types"] = sorted(cur_types)
-    cur["sources"] = sorted(cur_sources)
-    cur["texts"] = cur_texts
-    merged.append(cur)
+    merged.append(finalize(cur, cur_entity_ids, cur_types, cur_sources, cur_texts))
     return merged

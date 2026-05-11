@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
+import hashlib
 import json
 import logging
 import tempfile
@@ -36,6 +37,11 @@ class PIIMaskingPipeline:
         self.input_root = Path(config.paths.input_root)
         self.output_root = ensure_dir(config.paths.output_root)
         self.work_dir = ensure_dir(config.paths.work_dir)
+        if bool(getattr(config.runtime, "sidecar_include_words", False)):
+            logger.warning(
+                "runtime.sidecar_include_words=true stores word-level transcripts and confidence in sidecar JSON. "
+                "Treat sidecars as sensitive PII/PHI artifacts."
+            )
         self.asr = MultiASRTranscriber(config.asr)
         self.detector = PIIDetector(config.pii)
 
@@ -611,10 +617,13 @@ class PIIMaskingPipeline:
                     ctx = contexts[file_id]
                     enriched = []
                     for e in entities:
-                        ent = dict(e)
-                        ent["channel"] = int(item["channel"])
-                        ent["transcript_source"] = item["source"]
-                        ent["asr_engine"] = item.get("engine")
+                        ent = self._enrich_entity(
+                            e,
+                            channel=int(item["channel"]),
+                            transcript_source=item["source"],
+                            asr_engine=item.get("engine"),
+                            existing_count=len(ctx["all_entities"]) + len(enriched),
+                        )
                         enriched.append(ent)
                         ctx["all_entities"].append(ent)
                     spans, used = self._map_entities_to_spans_conservative(
@@ -683,8 +692,14 @@ class PIIMaskingPipeline:
         if not self._has_any_transcript(transcripts):
             if duration is None:
                 raise RuntimeError("ASR produced no transcript and input duration is unavailable; refusing to copy unmasked audio")
-            raw_spans = self._full_audio_spans(duration, channels=int(meta.get("channels") or self.config.masking.output_channels))
+            sentinel_id = f"ent_{len(all_entities) + 1:06d}"
+            raw_spans = self._full_audio_spans(
+                duration,
+                channels=int(meta.get("channels") or self.config.masking.output_channels),
+                entity_ids=[sentinel_id],
+            )
             all_entities = list(all_entities) + [{
+                "entity_id": sentinel_id,
                 "text": "",
                 "type": "EMPTY_TRANSCRIPT_FAILSAFE",
                 "start": 0,
@@ -988,16 +1003,34 @@ class PIIMaskingPipeline:
         for result, entities in zip(results, detected):  # type: ignore[assignment]
             enriched = []
             for e in entities:
-                ent = dict(e)
-                ent["channel"] = result.channel
-                ent["transcript_source"] = result.engine
-                ent["asr_engine"] = result.engine
+                ent = self._enrich_entity(
+                    e,
+                    channel=result.channel,
+                    transcript_source=result.engine,
+                    asr_engine=result.engine,
+                    existing_count=len(all_entities) + len(enriched),
+                )
                 enriched.append(ent)
                 all_entities.append(ent)
             spans, used = self._map_entities_to_spans_conservative(enriched, result.words, result.channel, duration)
             raw_spans.extend(spans)
             fallback_used = fallback_used or used
         return fallback_used
+
+    @staticmethod
+    def _enrich_entity(
+        entity: dict,
+        channel: int,
+        transcript_source: str,
+        asr_engine: Optional[str],
+        existing_count: int,
+    ) -> dict:
+        ent = dict(entity)
+        ent["channel"] = int(channel)
+        ent["transcript_source"] = transcript_source
+        ent["asr_engine"] = asr_engine
+        ent.setdefault("entity_id", f"ent_{int(existing_count) + 1:06d}")
+        return ent
 
     def _handle_asr_bundles(
         self,
@@ -1022,10 +1055,13 @@ class PIIMaskingPipeline:
         for item, entities in zip(detection_items, detected_batches):
             enriched = []
             for e in entities:
-                ent = dict(e)
-                ent["channel"] = int(item["channel"])
-                ent["transcript_source"] = item["source"]
-                ent["asr_engine"] = item.get("engine")
+                ent = self._enrich_entity(
+                    e,
+                    channel=int(item["channel"]),
+                    transcript_source=item["source"],
+                    asr_engine=item.get("engine"),
+                    existing_count=len(all_entities) + len(enriched),
+                )
                 enriched.append(ent)
                 all_entities.append(ent)
             spans, used = self._map_entities_to_spans_conservative(enriched, item.get("words") or [], int(item["channel"]), duration)
@@ -1101,8 +1137,9 @@ class PIIMaskingPipeline:
                         return True
         return False
 
-    def _full_audio_spans(self, duration: float, channels: int = 2) -> list[dict]:
+    def _full_audio_spans(self, duration: float, channels: int = 2, entity_ids: Optional[list[str]] = None) -> list[dict]:
         n_channels = max(1, min(int(channels or 2), int(self.config.masking.output_channels or 2)))
+        ids = list(entity_ids or [])
         return [
             {
                 "start": 0.0,
@@ -1112,6 +1149,8 @@ class PIIMaskingPipeline:
                 "source": "empty_transcript_failsafe",
                 "type": "EMPTY_TRANSCRIPT_FAILSAFE",
                 "text": "",
+                "entity_ids": ids,
+                "entity_id": ids[0] if len(ids) == 1 else None,
             }
             for channel in range(n_channels)
         ]
@@ -1131,7 +1170,9 @@ class PIIMaskingPipeline:
         spans: list[dict] = []
         channels = sorted({int(e.get("channel", -1)) for e in all_entities})
         for ch in channels:
-            texts = [str(e.get("text", "")) for e in all_entities if int(e.get("channel", -1)) == ch]
+            channel_entities = [e for e in all_entities if int(e.get("channel", -1)) == ch]
+            texts = [str(e.get("text", "")) for e in channel_entities]
+            entity_ids = sorted({str(e.get("entity_id")) for e in channel_entities if e.get("entity_id")})
             spans.append({
                 "channel": ch,
                 "start": 0.0,
@@ -1141,6 +1182,8 @@ class PIIMaskingPipeline:
                 "text": " | ".join(t for t in texts if t)[:500],
                 "source": "unmapped_entity_policy",
                 "score": 1.0,
+                "entity_ids": entity_ids,
+                "entity_id": entity_ids[0] if len(entity_ids) == 1 else None,
             })
         return spans, True
 
@@ -1193,6 +1236,160 @@ class PIIMaskingPipeline:
             atomic=self.config.runtime.atomic_output,
         )
 
+    @staticmethod
+    def _confidence_summary(words: list[dict]) -> dict:
+        probabilities: list[float] = []
+        for word in words or []:
+            value = word.get("probability")
+            if value is None:
+                continue
+            try:
+                probability = float(value)
+            except (TypeError, ValueError):
+                continue
+            probabilities.append(max(0.0, min(1.0, probability)))
+
+        if not probabilities:
+            return {
+                "transcript_confidence": None,
+                "confidence_method": "unavailable",
+                "confidence_summary": {
+                    "avg_word_probability": None,
+                    "min_word_probability": None,
+                    "word_probability_count": 0,
+                    "low_confidence_word_count": 0,
+                },
+            }
+
+        avg_probability = float(sum(probabilities) / len(probabilities))
+        min_probability = float(min(probabilities))
+        return {
+            "transcript_confidence": avg_probability,
+            "confidence_method": "mean_word_probability",
+            "confidence_summary": {
+                "avg_word_probability": avg_probability,
+                "min_word_probability": min_probability,
+                "word_probability_count": len(probabilities),
+                "low_confidence_word_count": sum(1 for p in probabilities if p < 0.50),
+            },
+        }
+
+    def _pii_detectors_enabled(self) -> list[str]:
+        detectors: list[str] = []
+        cfg = self.config.pii
+        if bool(getattr(cfg, "enable_regex", False)):
+            detectors.append("regex")
+        if bool(getattr(cfg, "enable_spoken_number_rules", False)):
+            detectors.append("spoken_number_rule")
+        detectors.append("rule_name")
+        if bool(getattr(cfg, "enable_saved_pii_json", False)):
+            detectors.append("saved_pii_json")
+        if bool(getattr(cfg, "enable_gliner", False)):
+            detectors.append("gliner")
+        if bool(getattr(cfg, "enable_piiranha", False)):
+            detectors.append("piiranha")
+        if bool(getattr(cfg, "enable_spacy", False)):
+            detectors.append("spacy")
+        return detectors
+
+    def _pii_detectors_loaded(self) -> dict:
+        detector = getattr(self, "detector", None)
+        return {
+            "regex": bool(getattr(self.config.pii, "enable_regex", False)),
+            "spoken_number_rule": bool(getattr(self.config.pii, "enable_spoken_number_rules", False)),
+            "rule_name": True,
+            "saved_pii_json": bool(getattr(self.config.pii, "enable_saved_pii_json", False)),
+            "gliner": getattr(detector, "gliner_model", None) is not None,
+            "piiranha": getattr(detector, "piiranha_pipe", None) is not None,
+            "spacy": getattr(detector, "spacy_nlp", None) is not None,
+        }
+
+    def _pii_detection_items_from_transcripts(self, transcripts: list[dict]) -> list[dict]:
+        scope = str(getattr(self.config.asr, "pii_detection_transcript_scope", "final_and_all_engines"))
+        items: list[dict] = []
+        seen: set[tuple[int, str, Optional[str], int]] = set()
+
+        def add(channel: int, source: str, engine: Optional[str], text: str, word_count: int) -> None:
+            text = str(text or "").strip()
+            if not text:
+                return
+            text_hash = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+            key = (int(channel), source, engine, text_hash)
+            if key in seen:
+                return
+            seen.add(key)
+            items.append({
+                "channel": int(channel),
+                "source": source,
+                "asr_engine": engine,
+                "text_char_count": len(text),
+                "word_count": int(word_count),
+            })
+
+        for row in transcripts or []:
+            channel = int(row.get("channel", -1))
+            if row.get("engine") == "consensus":
+                if scope in {"final_only", "final_and_all_engines"}:
+                    consensus = row.get("consensus") or {}
+                    add(
+                        channel,
+                        "final_consensus",
+                        consensus.get("selected_engine"),
+                        str(row.get("final_transcript") or row.get("transcript") or ""),
+                        int(row.get("word_count") or 0),
+                    )
+                if scope in {"all_engines_only", "final_and_all_engines"}:
+                    engine_transcripts = row.get("engine_transcripts") or {}
+                    engine_results = {r.get("engine"): r for r in row.get("engine_results", []) if isinstance(r, dict)}
+                    for engine, text in engine_transcripts.items():
+                        result = engine_results.get(engine) or {}
+                        add(channel, f"engine:{engine}", engine, str(text or ""), int(result.get("word_count") or 0))
+            else:
+                engine = row.get("engine")
+                add(channel, str(engine or "unknown"), engine, str(row.get("transcript") or ""), int(row.get("word_count") or 0))
+        return items
+
+    @staticmethod
+    def _span_entity_ids(span: dict) -> set[str]:
+        ids: set[str] = set()
+        if span.get("entity_id"):
+            ids.add(str(span["entity_id"]))
+        for entity_id in span.get("entity_ids") or []:
+            if entity_id:
+                ids.add(str(entity_id))
+        return ids
+
+    def _masking_audit(self, all_entities: list[dict], raw_spans: list[dict], merged_spans: list[dict], unmapped_fallback_used: bool) -> dict:
+        detected_ids = sorted({str(e.get("entity_id")) for e in all_entities if e.get("entity_id")})
+        missing_id_count = sum(1 for e in all_entities or [] if not e.get("entity_id"))
+        timestamp_ids: set[str] = set()
+        fallback_ids: set[str] = set()
+        for span in raw_spans or []:
+            ids = self._span_entity_ids(span)
+            if (
+                str(span.get("type")) in {"UNMAPPED_PII_FALLBACK", "EMPTY_TRANSCRIPT_FAILSAFE"}
+                or str(span.get("source")) in {"unmapped_entity_policy", "empty_transcript_failsafe"}
+            ):
+                fallback_ids.update(ids)
+            elif ids:
+                timestamp_ids.update(ids)
+
+        covered = timestamp_ids | fallback_ids
+        without_masking = sorted(set(detected_ids) - covered)
+        return {
+            "detected_entity_count": len(all_entities or []),
+            "raw_span_count": len(raw_spans or []),
+            "merged_span_count": len(merged_spans or []),
+            "entity_ids_detected": detected_ids,
+            "entity_ids_with_timestamp_spans": sorted(timestamp_ids),
+            "entity_ids_with_full_channel_fallback": sorted(fallback_ids),
+            "entity_ids_covered_by_masking": sorted(covered),
+            "entity_ids_without_masking": without_masking,
+            "entities_missing_id_field": missing_id_count,
+            "all_detected_entities_masked": not without_masking and missing_id_count == 0,
+            "unmapped_fallback_used": bool(unmapped_fallback_used),
+        }
+
     def _build_sidecar(
         self,
         input_path: Path,
@@ -1241,6 +1438,14 @@ class PIIMaskingPipeline:
             },
             "unmapped_entity_policy": self.config.masking.unmapped_entity_policy,
             "unmapped_fallback_used": unmapped_fallback_used,
+            "pii_detection": {
+                "transcript_scope": self.config.asr.pii_detection_transcript_scope,
+                "detectors_enabled": self._pii_detectors_enabled(),
+                "detectors_loaded": self._pii_detectors_loaded(),
+                "detection_items": self._pii_detection_items_from_transcripts(transcripts),
+                "entity_sources": sorted({str(e.get("source")) for e in all_entities if e.get("source")}),
+            },
+            "masking_audit": self._masking_audit(all_entities, raw_spans, merged_spans, unmapped_fallback_used),
             "transcripts": transcripts,
             "entities": all_entities,
             "raw_spans": raw_spans,
@@ -1283,6 +1488,7 @@ class PIIMaskingPipeline:
 
     def _bundle_to_transcript_dict(self, bundle: ChannelASRBundle) -> Dict[str, Any]:
         engine_rows = [self._asr_result_to_dict(r) for r in bundle.engine_results]
+        confidence = self._confidence_summary(bundle.final_words)
         d: Dict[str, Any] = {
             "file_id": getattr(bundle, "file_id", None),
             "channel": bundle.channel,
@@ -1296,6 +1502,7 @@ class PIIMaskingPipeline:
             "engine_transcripts": {r.engine: r.transcript for r in bundle.engine_results},
             "engine_errors": {r.engine: r.error for r in bundle.engine_results if r.error},
             "engine_results": engine_rows,
+            **confidence,
         }
         if self.config.runtime.sidecar_include_words:
             d["words"] = bundle.final_words
@@ -1303,6 +1510,7 @@ class PIIMaskingPipeline:
         return d
 
     def _asr_result_to_dict(self, result: ASRResult) -> Dict[str, Any]:
+        confidence = self._confidence_summary(result.words)
         d = {
             "file_id": getattr(result, "file_id", None),
             "channel": result.channel,
@@ -1315,6 +1523,7 @@ class PIIMaskingPipeline:
             "timestamp_retry_used": result.timestamp_retry_used,
             "timestamp_suspicious": result.timestamp_suspicious,
             "error": result.error,
+            **confidence,
         }
         if self.config.runtime.sidecar_include_words:
             d["words"] = result.words

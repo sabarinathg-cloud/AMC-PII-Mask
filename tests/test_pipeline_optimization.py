@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -6,10 +7,13 @@ import pytest
 
 import pii_audio_masking_pipeline.audio_io as audio_io_module
 import pii_audio_masking_pipeline.pipeline as pipeline_module
+import pii_audio_masking_pipeline.utils as utils_module
 from pii_audio_masking_pipeline.asr import ASRResult, ChannelASRBundle, build_consensus
 from pii_audio_masking_pipeline.audio_io import AudioCommandError, encode_float32_stereo_to_opus
 from pii_audio_masking_pipeline.config import load_config
 from pii_audio_masking_pipeline.pipeline import PIIMaskingPipeline
+from pii_audio_masking_pipeline.timestamp_mapping import merge_spans
+from pii_audio_masking_pipeline.utils import write_json
 
 
 def _pipe(tmp_path: Path) -> PIIMaskingPipeline:
@@ -187,6 +191,199 @@ def test_batch_metrics_are_kept_separate_from_per_file_stage_timings(tmp_path: P
     assert per_file["asr_engine_sec"]["whisper"] == 2.0
     assert per_file["batch_size"] == 4
     assert "do not sum" in per_file["batch_metrics_semantics"]
+
+
+def test_asr_result_dict_includes_word_and_transcript_confidence_by_default(tmp_path: Path):
+    pipe = _pipe(tmp_path)
+
+    result = ASRResult(
+        channel=0,
+        transcript="hello John",
+        words=[
+            {"word": "hello", "start": 0.0, "end": 0.2, "probability": 0.9, "start_char": 0, "end_char": 5},
+            {"word": "John", "start": 0.3, "end": 0.5, "probability": 0.7, "start_char": 6, "end_char": 10},
+        ],
+        engine="whisper",
+        language="en",
+        language_probability=0.99,
+    )
+
+    row = pipe._asr_result_to_dict(result)
+
+    assert "words" in row
+    assert row["words"][0]["probability"] == 0.9
+    assert row["transcript_confidence"] == pytest.approx(0.8)
+    assert row["confidence_method"] == "mean_word_probability"
+    assert row["confidence_summary"] == {
+        "avg_word_probability": pytest.approx(0.8),
+        "min_word_probability": pytest.approx(0.7),
+        "word_probability_count": 2,
+        "low_confidence_word_count": 0,
+    }
+
+
+def test_sidecar_includes_pii_detector_coverage_and_masking_audit(tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    entities = [
+        {
+            "entity_id": "ent_000001",
+            "text": "John Smith",
+            "type": "PERSON_NAME",
+            "start": 6,
+            "end": 16,
+            "score": 0.99,
+            "source": "piiranha",
+            "channel": 0,
+            "asr_engine": "whisper",
+            "transcript_source": "engine:whisper",
+        },
+        {
+            "entity_id": "ent_000002",
+            "text": "account number",
+            "type": "ACCOUNT_NUMBER",
+            "start": 20,
+            "end": 34,
+            "score": 0.92,
+            "source": "gliner",
+            "channel": 1,
+            "asr_engine": "qwen",
+            "transcript_source": "engine:qwen",
+        },
+    ]
+    raw_spans = [
+        {
+            "entity_id": "ent_000001",
+            "channel": 0,
+            "start": 0.1,
+            "end": 0.8,
+            "duration": 0.7,
+            "type": "PERSON_NAME",
+            "source": "piiranha",
+        },
+        {
+            "entity_ids": ["ent_000002"],
+            "channel": 1,
+            "start": 0.0,
+            "end": 3.0,
+            "duration": 3.0,
+            "type": "UNMAPPED_PII_FALLBACK",
+            "source": "unmapped_entity_policy",
+        },
+    ]
+
+    sidecar = pipe._build_sidecar(
+        input_path=tmp_path / "input" / "audio.opus",
+        output_path=tmp_path / "output" / "audio.opus",
+        meta={"duration_sec": 3.0},
+        elapsed=0.1,
+        transcripts=[],
+        all_entities=entities,
+        raw_spans=raw_spans,
+        merged_spans=raw_spans,
+        validation={"valid": True},
+        status="success_unmapped_fallback",
+        used_single_decode=True,
+        used_combined_channel_extract=False,
+        unmapped_fallback_used=True,
+        no_pii_fast_copy_used=False,
+    )
+
+    assert sidecar["pii_detection"]["transcript_scope"] == "final_and_all_engines"
+    assert "piiranha" in sidecar["pii_detection"]["detectors_enabled"]
+    assert "gliner" in sidecar["pii_detection"]["detectors_enabled"]
+    assert sidecar["pii_detection"]["entity_sources"] == ["gliner", "piiranha"]
+    assert sidecar["masking_audit"]["detected_entity_count"] == 2
+    assert sidecar["masking_audit"]["entity_ids_with_timestamp_spans"] == ["ent_000001"]
+    assert sidecar["masking_audit"]["entity_ids_with_full_channel_fallback"] == ["ent_000002"]
+    assert sidecar["masking_audit"]["entity_ids_without_masking"] == []
+    assert sidecar["masking_audit"]["all_detected_entities_masked"] is True
+
+
+def test_write_json_creates_private_sidecar_file(tmp_path: Path):
+    path = tmp_path / "audio.opus.pii_masking.json"
+
+    write_json(path, {"transcripts": [{"transcript": "contains PHI"}]})
+
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_json_creates_temp_file_private_from_first_byte(monkeypatch, tmp_path: Path):
+    path = tmp_path / "audio.opus.pii_masking.json"
+    real_open = os.open
+    modes: list[int] = []
+
+    def recording_open(file, flags, mode=0o777, *args, **kwargs):
+        modes.append(mode)
+        return real_open(file, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(utils_module.os, "open", recording_open)
+
+    write_json(path, {"transcripts": [{"transcript": "contains PHI"}]})
+
+    assert modes
+    assert modes[0] == 0o600
+
+
+def test_merge_spans_preserves_all_entity_ids_when_spans_overlap():
+    merged = merge_spans([
+        {"channel": 0, "start": 0.0, "end": 0.4, "type": "PHONE", "source": "regex", "text": "one", "entity_id": "ent_000001"},
+        {"channel": 0, "start": 0.3, "end": 0.8, "type": "EMAIL", "source": "piiranha", "text": "two", "entity_id": "ent_000002"},
+    ])
+
+    assert len(merged) == 1
+    assert merged[0]["entity_id"] is None
+    assert merged[0]["entity_ids"] == ["ent_000001", "ent_000002"]
+
+
+def test_confidence_summary_clamps_out_of_range_probabilities(tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    result = ASRResult(
+        channel=0,
+        transcript="bad scale",
+        words=[
+            {"word": "bad", "probability": 1.5},
+            {"word": "scale", "probability": -0.5},
+        ],
+        engine="whisper",
+    )
+
+    row = pipe._asr_result_to_dict(result)
+
+    assert row["confidence_summary"]["avg_word_probability"] == pytest.approx(0.5)
+    assert row["confidence_summary"]["min_word_probability"] == pytest.approx(0.0)
+    assert row["transcript_confidence"] == pytest.approx(0.5)
+
+
+def test_masking_audit_flags_entities_without_ids_as_not_fully_auditable(tmp_path: Path):
+    pipe = _pipe(tmp_path)
+
+    audit = pipe._masking_audit(
+        all_entities=[{"text": "John Smith", "source": "piiranha"}],
+        raw_spans=[],
+        merged_spans=[],
+        unmapped_fallback_used=False,
+    )
+
+    assert audit["entities_missing_id_field"] == 1
+    assert audit["all_detected_entities_masked"] is False
+
+
+def test_empty_transcript_failsafe_has_entity_id_and_audits_as_masked(tmp_path: Path):
+    pipe = _pipe(tmp_path)
+    sentinel_id = "ent_000001"
+    spans = pipe._full_audio_spans(3.0, channels=2, entity_ids=[sentinel_id])
+    audit = pipe._masking_audit(
+        all_entities=[{"entity_id": sentinel_id, "type": "EMPTY_TRANSCRIPT_FAILSAFE", "source": "pipeline"}],
+        raw_spans=spans,
+        merged_spans=spans,
+        unmapped_fallback_used=True,
+    )
+
+    assert all(span["entity_ids"] == [sentinel_id] for span in spans)
+    assert audit["entities_missing_id_field"] == 0
+    assert audit["entity_ids_with_timestamp_spans"] == []
+    assert audit["entity_ids_with_full_channel_fallback"] == [sentinel_id]
+    assert audit["all_detected_entities_masked"] is True
 
 
 def test_encode_applies_minimum_bitrate_floor(monkeypatch, tmp_path: Path):

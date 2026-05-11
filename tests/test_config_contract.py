@@ -13,7 +13,7 @@ def test_config_example_exposes_pipeline_runtime_contract():
     assert cfg.runtime.copy_unmasked_when_no_pii is True
     assert cfg.runtime.unmasked_copy_method == "hardlink_or_copy"
     assert cfg.runtime.atomic_output is True
-    assert cfg.runtime.sidecar_include_words is False
+    assert cfg.runtime.sidecar_include_words is True
     assert cfg.runtime.max_csv_report_rows == 10000
     assert cfg.runtime.file_batch_size == 2
     assert cfg.runtime.file_batch_max_decoded_audio_gb == 2.0
